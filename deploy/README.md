@@ -48,9 +48,27 @@ sudo ./deploy/provision-db.sh
 ```
 
 That creates a **non-superuser role** and a database owned by it, generates a
-32-character alphanumeric password, verifies the credentials actually
-authenticate over TCP, and writes the connection string to
-`/etc/crm-light/db.env` (mode `0600`, root-only).
+32-character alphanumeric password, checks the credentials actually authenticate
+over TCP, and writes the connection string to `/etc/crm-light/db.env` (mode
+`0600`, root-only).
+
+It asks two separate questions at the end, because they are not the same one:
+
+- **Can a client reach the database as this role?** Answered by connecting.
+- **Is the password actually being checked?** *Not* answered by connecting. On a
+  cluster whose `pg_hba.conf` says `trust` — the Homebrew default, and common in
+  development — any password succeeds, so a successful connection proves
+  nothing about the credential. The script reads `pg_hba_file_rules` and tells
+  you which of the two situations you are in:
+
+  ```
+  verified: connected as 'crm_light' to 'crm_light', password enforced ('scram-sha-256').
+  ```
+
+  or a warning that the connection works but the password is not protecting
+  anything yet, with the `pg_hba.conf` line to change. On a single-host
+  deployment that is a deliberate and common choice, so it is a warning rather
+  than a failure.
 
 The password is deliberately **not printed**. It is in that file — read it with
 `sudo cat /etc/crm-light/db.env` if you want it, but the app reads it from there,
@@ -216,6 +234,19 @@ Migrations are applied at startup and are idempotent, so a restart is the
 upgrade. That also means **a restart is a schema change**: take a backup before
 deploying one, because rolling back the binary does not roll back the schema.
 
+**Testing the scripts without a server.** `provision-db.sh` runs `psql` through
+`sudo -u postgres` by default, which is what a stock Ubuntu cluster wants.
+Setting `CRM_PG_SUPERUSER` names a superuser role to connect as instead, which
+is how it is exercised against a cluster where no `sudo` is needed:
+
+```bash
+CRM_PG_SUPERUSER=postgres ./deploy/provision-db.sh --db scratch --out /tmp/scratch.env
+```
+
+It prints a note when it takes that path, and leaves the env file owned by you
+rather than root. It is not the deployment path — nothing about running it under
+`sudo` changes.
+
 **Rotating the database password.**
 
 ```bash
@@ -259,12 +290,37 @@ signs cookies weakly, and says so.
 stock Ubuntu install it listens on `127.0.0.1:5432`; if it is on a unix socket
 only, check `listen_addresses` in `postgresql.conf`.
 
-**`password authentication failed`.** The password in `db.env` and the one on
-the role have diverged — usually because `provision-db.sh` was run but the app
-was not restarted, or because `app.env` still holds an old `CRM_DB`. Re-run
-`configure.sh` and restart. If you edited `pg_hba.conf`, remember that the first
-matching line wins: a `trust` line above your `scram-sha-256` line means the
-password is never checked.
+**`password authentication failed`.** Two causes, and they need opposite fixes.
+
+The password in `db.env` and the one on the role have diverged — usually because
+`provision-db.sh` was run but the app was not restarted, or because `app.env`
+still holds an old `CRM_DB`. Re-run `configure.sh` and restart.
+
+Or the password was never set on the role. An earlier version of
+`provision-db.sh` built its `CREATE ROLE` with `format()` and one argument too
+many; because `format` ignores extra arguments, the password silently became the
+*role name*, and on some PostgreSQL builds the same mismatch is a syntax error at
+the first `%` instead. Check what is actually stored:
+
+```bash
+sudo -u postgres psql -tAc \
+  "SELECT rolname, rolpassword IS NOT NULL FROM pg_authid WHERE rolname='crm_light'"
+```
+
+A `NULL` or unexpected result means re-run `provision-db.sh`, which sets the
+password with psql's own `:'password'` quoting and does not go through
+`format()` at all.
+
+**Connecting works but you are not sure the password is enforced.** Check it:
+
+```bash
+sudo -u postgres psql -tAc \
+  "SELECT type, database, user_name, auth_method FROM pg_hba_file_rules WHERE type LIKE 'host%'"
+```
+
+`trust` means the password is not checked. For a database on the same machine
+that is a common, deliberate configuration; change the loopback line to
+`scram-sha-256` if you want it enforced.
 
 **Sign-in appears to do nothing.** Almost always `CRM_COOKIE_SECURE=1` while
 serving plain HTTP: the browser receives the cookie and refuses to send it back.

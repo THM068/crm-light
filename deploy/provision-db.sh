@@ -80,7 +80,8 @@ done
 
 die() { echo "provision-db: $*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "run this with sudo (it needs to act as the postgres user)"
+[ "$(id -u)" -eq 0 ] || [ -n "${CRM_PG_SUPERUSER:-}" ] \
+    || die "run this with sudo (it needs to act as the postgres user)"
 command -v psql >/dev/null 2>&1 || die "psql not found; install postgresql first (apt install postgresql)"
 command -v openssl >/dev/null 2>&1 || die "openssl not found; install it (apt install openssl)"
 
@@ -96,9 +97,27 @@ done
 # `sudo -u postgres psql` is how the installer, and every guide, reaches the
 # cluster: it uses peer authentication over the unix socket. OVERRIDES outside
 # the shell so a stray PGHOST in the environment cannot redirect it.
-as_postgres() {
-    sudo -u postgres env -u PGHOST -u PGPORT -u PGDATABASE -u PGUSER psql -v ON_ERROR_STOP=1 "$@"
-}
+#
+# Setting CRM_PG_SUPERUSER names a role to connect as instead, which is how this
+# is exercised in a test: on a cluster where you already are a superuser, no
+# `sudo` is involved. Nothing about the deployment path changes.
+#
+# `-d postgres` is explicit rather than left to the default: psql picks the
+# database named after the connecting role when none is given, and a role
+# without a same-named database — a superuser called `admin`, say — fails before
+# it runs anything. A later `-d "$DB_NAME"` on the command line overrides it,
+# since psql takes the last one.
+if [ -n "${CRM_PG_SUPERUSER:-}" ]; then
+    echo "note: connecting as '${CRM_PG_SUPERUSER}' (CRM_PG_SUPERUSER) rather than via sudo"
+    as_postgres() {
+        psql -U "$CRM_PG_SUPERUSER" -d postgres -v ON_ERROR_STOP=1 "$@"
+    }
+else
+    as_postgres() {
+        sudo -u postgres env -u PGHOST -u PGPORT -u PGDATABASE -u PGUSER \
+            psql -d postgres -v ON_ERROR_STOP=1 "$@"
+    }
+fi
 
 if [ "$DROP" = "yes" ]; then
     echo "!! --drop was given: DROPPING database '$DB_NAME' and role '$DB_ROLE'."
@@ -118,18 +137,33 @@ DB_PASSWORD="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)"
 
 # --- Role -----------------------------------------------------------------
 #
-# `\gexec` runs whatever the query returns, which is how the create and the
-# rotate can be one code path: the query either emits a CREATE ROLE or an ALTER
-# ROLE, and neither the password nor the SQL is ever on a command line.
+# Two things this deliberately does NOT do, both of which broke an earlier
+# version of this script:
+#
+#   * No `format(...)` with `%I` / `%L`. `format` consumes exactly as many
+#     arguments as the format string has specs and ignores any extras, so
+#     passing one argument too many does not fail — it silently shifts every
+#     value one place along, and the password ends up being the role name. On
+#     some builds the same mismatch is a syntax error at the first `%` instead.
+#     Either way it is the wrong tool: psql can do the quoting itself.
+#
+#   * No `\gexec` building SQL from a query. psql's `\if` says what is meant.
+#
+# `:"role"` quotes an identifier and `:'password'` quotes a string literal, both
+# handled by psql *after* variable substitution, which is what makes this safe
+# with a password containing quotes and correct regardless of server version.
+#
+# `-v password=...` goes on the command line for psql itself, not for the
+# server: psql's own arguments are not visible in the server's logs or in
+# `pg_stat_activity`, unlike a value interpolated into a query text.
 echo "role '$DB_ROLE':"
-as_postgres -q <<SQL
-SELECT format(
-    CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %L)
-         THEN 'ALTER ROLE %I WITH LOGIN PASSWORD %L'
-         ELSE 'CREATE ROLE %I WITH LOGIN PASSWORD %L'
-    END,
-    '$DB_ROLE', '$DB_ROLE', '$DB_PASSWORD')
-\gexec
+as_postgres -q -v ON_ERROR_STOP=1 -v role="$DB_ROLE" -v password="$DB_PASSWORD" <<'SQL'
+SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') AS role_exists \gset
+\if :role_exists
+    ALTER ROLE :"role" WITH LOGIN PASSWORD :'password';
+\else
+    CREATE ROLE :"role" WITH LOGIN PASSWORD :'password';
+\endif
 SQL
 
 # --- Database -------------------------------------------------------------
@@ -175,11 +209,15 @@ DB_URL="postgresql://${DB_ROLE}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?
 
 # --- Write it out ---------------------------------------------------------
 #
-# The connection string carries the password. It goes in a 0600 file owned by
-# root, and the systemd unit reads it from there; see deploy/systemd/README.md
-# for why it is not simply an Environment= line in the unit.
+# The connection string carries the password. It goes in a 0600 file, owned by
+# root on a real run, and the systemd unit reads it from there; the ownership
+# matters because the unit runs as root and the *app* user has no business
+# reading the file that contains the database password.
 OUT_DIR="$(dirname "$OUT_FILE")"
-install -d -m 0750 "$OUT_DIR"
+# `install -d` on a path that already exists and is not ours can fail on an
+# unusual filesystem; creating the directory without it is the fallback, so the
+# script does not stop with a permissions complaint when it could carry on.
+install -d -m 0750 "$OUT_DIR" 2>/dev/null || mkdir -p "$OUT_DIR"
 
 # `umask 077` before creating, so the file is never briefly world-readable.
 ( umask 077; cat > "$OUT_FILE" <<EOF
@@ -189,22 +227,75 @@ CRM_DB=${DB_URL}
 EOF
 )
 chmod 0600 "$OUT_FILE"
-chown root:root "$OUT_FILE"
+if [ "$(id -u)" -eq 0 ]; then
+    chown root:root "$OUT_FILE"
+else
+    # Only reachable with CRM_PG_SUPERUSER set, i.e. in a test rather than a
+    # deployment. Say so, because an env file owned by your login user is fine
+    # for a local run and wrong for a service.
+    echo "note: not running as root, so ${OUT_FILE} was left owned by $(id -un)" >&2
+fi
 
 # --- Verify ---------------------------------------------------------------
 #
-# Prove the credentials work before claiming success. `\conninfo` is not enough;
-# this actually authenticates over TCP with the password, which is exactly what
-# the app will do at startup.
+# Two separate questions, and an earlier version of this script conflated them:
+#
+#   1. Can a client reach the database as this role over TCP?
+#   2. Is the password actually being checked when it does?
+#
+# Only the first is provable by connecting. On a cluster whose pg_hba.conf says
+# `trust` — which is the Homebrew default, and a common development setup — the
+# connection succeeds with *any* password, so a successful connect is no
+# evidence at all that the credential is right. Asking pg_hba_file_rules what
+# the matching rule actually says is what turns that into a real answer.
+#
+# Both column spellings are handled: PostgreSQL 14 calls these `type`,
+# `database`, `user_name`; 15 renamed them to `rule_type`, `databases`,
+# `user_names`. Matching either is cheaper than requiring a version.
+echo
 if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_ROLE" -d "$DB_NAME" \
         -tAc "SELECT 'connected as ' || current_user || ' to ' || current_database();" 2>/dev/null; then
-    :
+    AUTH_METHOD="$(as_postgres -tA -v ON_ERROR_STOP=1 -v db="$DB_NAME" -v role="$DB_ROLE" <<'SQL' 2>/dev/null || true
+SELECT coalesce(
+    (SELECT auth_method FROM pg_hba_file_rules
+      WHERE type LIKE 'host%'
+        AND ('all' = ANY(database) OR :'db' = ANY(database))
+        AND ('all' = ANY(user_name) OR :'role' = ANY(user_name))
+        AND error IS NULL
+      ORDER BY line_number LIMIT 1),
+    '') AS auth_method \gset
+SELECT :'auth_method'
+SQL
+)"
+    case "$AUTH_METHOD" in
+        trust|peer|ident)
+            cat >&2 <<EOF
+WARNING: the connection works, but PostgreSQL is NOT checking the password.
+
+  pg_hba.conf matches these connections with auth method '$AUTH_METHOD', so any
+  password would have been accepted. The stored credential has been set
+  correctly — this is about your server's configuration, not the script's — but
+  it means the password is not protecting anything yet.
+
+  For a database on the same machine this is a common and deliberate choice.
+  If you want the password enforced, set the host line for 127.0.0.1/32 to
+  'scram-sha-256' in $(as_postgres -tAc "SHOW hba_file" 2>/dev/null || echo pg_hba.conf),
+  then: sudo systemctl reload postgresql
+EOF
+            ;;
+        "")
+            echo "note: could not read pg_hba.conf (permissions?); the password-"
+            echo "      enforcement check was skipped, but the connection works."
+            ;;
+        *)
+            echo "verified: connected as '$DB_ROLE' to '$DB_NAME', password enforced ('$AUTH_METHOD')."
+            ;;
+    esac
 else
     die "created the role and database, but could not connect with them.
-Check that PostgreSQL accepts password authentication on ${DB_HOST}:${DB_PORT} —
+Check that PostgreSQL accepts host connections on ${DB_HOST}:${DB_PORT} —
 in pg_hba.conf the line for host connections should say 'scram-sha-256' (or
-'md5'), and 'trust' or 'peer' where you expected a password usually means the
-line above it matched first.
+'md5'), and a line above it saying 'reject' will win before yours is reached.
 The connection string is in ${OUT_FILE}."
 fi
 
@@ -214,7 +305,7 @@ Done.
 
   role        ${DB_ROLE}  (login, not superuser, no CREATEDB/CREATEROLE)
   database    ${DB_NAME}  (owned by ${DB_ROLE})
-  env file    ${OUT_FILE}  (0600, root:root)
+  env file    ${OUT_FILE}  (0600, owned by $(id -un))
 
 The password is in ${OUT_FILE} and is not printed here on purpose, so it does not
 end up in your shell history or a paste buffer.
