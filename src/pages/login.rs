@@ -87,7 +87,14 @@ async fn login_form(cx: &Cx) -> Result<impl View> {
                 <button class="btn btn-primary" type="submit">"Sign in"</button>
             </form>
 
-            <p class="muted">"No workspace yet? " <a href="/signup">"Create one"</a></p>
+            if crate::config_of(cx).allow_signup {
+                <p class="muted">"No workspace yet? " <a href="/signup">"Create one"</a></p>
+            } else {
+                <p class="muted">
+                    "This installation is not accepting new workspaces. Ask an administrator
+                    of your workspace to add you."
+                </p>
+            }
         </div>
     })
 }

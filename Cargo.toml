@@ -48,5 +48,8 @@ jiff = "0.2"
 # has no better representation. Also used by the migration CLI.
 anyhow = "1"
 
+# Transliterates a workspace name to an ASCII sign-in slug, so `Müller GmbH`
+# becomes `muller-gmbh` rather than a mangled fragment.
+deunicode = "1.6"
+
 toasty-cli = { version = "0.10.0", optional = true }
-deunicode = "1.6.2"

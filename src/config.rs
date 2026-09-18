@@ -46,6 +46,14 @@ pub struct Config {
     /// field blank.
     pub allow_passwordless_login: bool,
 
+    /// Whether a stranger may create a workspace at `/signup`.
+    ///
+    /// On by default so a fresh installation is reachable. Turn it off once the
+    /// workspaces you want exist: on a server that anything can reach, an open
+    /// sign-up lets anyone who finds the port create a tenant, and the app has
+    /// no invitation, email check, or CAPTCHA to slow that down.
+    pub allow_signup: bool,
+
     /// Insert the demo dataset when the database has no companies.
     pub seed_demo_data: bool,
 }
@@ -185,6 +193,16 @@ impl Config {
             );
         }
 
+        let allow_signup = env_bool("CRM_ALLOW_SIGNUP", true)?;
+        if allow_signup {
+            warnings.push(
+                "CRM_ALLOW_SIGNUP is on: anyone who can reach this port can create a workspace. \
+                 Set CRM_ALLOW_SIGNUP=0 on a server that is reachable from outside, once the \
+                 workspaces you want exist."
+                    .to_string(),
+            );
+        }
+
         let config = Self {
             database_url,
             time_zone,
@@ -195,6 +213,7 @@ impl Config {
             login_max_attempts,
             login_lockout: Duration::from_secs(lockout_minutes as u64 * 60),
             allow_passwordless_login,
+            allow_signup,
             // `CRM_SEED=0` disables; anything else (including unset) seeds.
             seed_demo_data: env("CRM_SEED").as_deref() != Some("0"),
         };
@@ -253,6 +272,7 @@ impl Config {
             login_max_attempts: 3,
             login_lockout: Duration::from_secs(60),
             allow_passwordless_login: true,
+            allow_signup: true,
             seed_demo_data: false,
         }
     }

@@ -43,6 +43,7 @@ until somebody has signed up. Set `CRM_SEED=0` to skip it entirely.
 | `CRM_PAGE_SIZE`             | `25`                                   | Rows per list page (1–500).                                           |
 | `CRM_LOGIN_MAX_ATTEMPTS`    | `8`                                    | Failed sign-ins before an account is temporarily locked.              |
 | `CRM_LOGIN_LOCKOUT_MINUTES` | `15`                                   | How long that lock lasts.                                             |
+| `CRM_ALLOW_SIGNUP`          | `1`                                    | Whether a stranger may create a workspace at `/signup`. **Set to `0` on any server the internet can reach.** |
 | `CRM_ALLOW_EMPTY_PASSWORD`  | `1`                                    | Whether an account with no stored password may sign in with a blank one. Nothing creates such an account, so this only matters for rows left by an older version. |
 | `CRM_SEED`                  | unset (on)                             | Set to `0` to skip the demo data.                                     |
 | `HOST`                      | `127.0.0.1`                            | Listen address (read by Topcoat).                                     |
@@ -87,7 +88,7 @@ PostgreSQL; see "What is not covered" below.
 
 | Page                  | What's there                                                        |
 | --------------------- | ------------------------------------------------------------------- |
-| `/signup`             | Create a workspace; you become its administrator                     |
+| `/signup`             | Create a workspace; you become its administrator (closable, see `CRM_ALLOW_SIGNUP`) |
 | `/login`              | Sign-in: workspace, username, password, optional two-factor code      |
 | `/`                   | Counts, pipeline value, pipeline by stage, paginated activity feed    |
 | `/companies`          | Searchable, paginated list with contact counts and open pipeline      |
@@ -157,9 +158,13 @@ Usernames are matched case-insensitively inside their workspace, and passwords
 are stored as Argon2id PHC strings with a per-password salt, so two accounts with
 the same password do not share a hash.
 
-**Sign-up is public.** Anyone who can reach the port can create a workspace; that
-is the point of a self-service installation, and it is also the thing to turn off
-first if this is exposed to a network you do not control.
+**Sign-up is public by default.** Anyone who can reach the port can create a
+workspace; that is the point of a self-service installation, and it is also the
+thing to turn off first if this is exposed to a network you do not control. Set
+`CRM_ALLOW_SIGNUP=0` once your workspaces exist: `/signup` then answers 404 and
+the login page stops advertising it. There is no invitation, email check, or
+CAPTCHA in between — see `deploy/README.md` for the deployment order that closes
+it.
 
 ### Roles
 
@@ -377,6 +382,32 @@ and tenant-first indexes for the `account_id` filter that leads almost every
 query. Without the second, the planner has to choose between the tenant index
 and the foreign-key index and filter afterwards.
 
+## Deploying it
+
+`deploy/` has what a remote Ubuntu server needs, and `deploy/README.md` is the
+runbook:
+
+| File | What it does |
+| ---- | ------------ |
+| `deploy/provision-db.sh` | Creates a non-superuser PostgreSQL role and a database it owns, generates a 32-character password, verifies the credentials authenticate over TCP, and writes the connection string to a root-only file. Idempotent; `--drop` destroys data and says so before doing it. |
+| `deploy/configure.sh` | Creates the service account, generates `CRM_SECRET_KEY` (preserved across re-runs, so re-running does not sign everyone out), writes the environment file, and installs a hardened systemd unit. |
+| `deploy/nginx/crm-light.conf` | TLS reverse proxy: HTTP/2, the redirect, rate limiting on `/login`, and forwarded headers. |
+
+The short version:
+
+```bash
+sudo ./deploy/provision-db.sh
+cargo build --release
+sudo ./deploy/configure.sh --domain crm.example.com --allow-signup
+sudo install -o crm-light -g crm-light -m 0755 target/release/crm-light /opt/crm-light/crm-light
+sudo systemctl enable --now crm-light
+# create your workspace at /signup, then close sign-up:
+sudo ./deploy/configure.sh --domain crm.example.com && sudo systemctl restart crm-light
+```
+
+Neither script needs to know your password: `configure.sh` reads the connection
+string out of the file `provision-db.sh` wrote, so it lives in one place.
+
 ## Notes and remaining limitations
 
 The list of things a production CRM would still want:
@@ -389,9 +420,9 @@ The list of things a production CRM would still want:
   trade; see "Isolation" above for how to collapse it into a 404.
 - **No per-record ownership inside a workspace.** Everyone in a workspace reads
   and writes everything in it. The role decides only who manages accounts.
-- **Sign-up is open, and anyone can create a workspace.** There is no
-  invitation, no email check, and no CAPTCHA. Self-service is the point, but on
-  a public network it is the first thing to gate.
+- **Sign-up is open until you close it.** There is no invitation, no email
+  check, and no CAPTCHA; `CRM_ALLOW_SIGNUP=0` is the whole of the access
+  control on creating a workspace.
 - **A workspace cannot be renamed or deleted from the UI**, and there is no
   "leave workspace" path for a member. The slug is a sign-in credential, so
   changing it is a bigger operation than it looks.

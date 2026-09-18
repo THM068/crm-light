@@ -19,7 +19,7 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        error::{SeeOther, bad_request, internal_server_error, see_other},
+        error::{SeeOther, bad_request, internal_server_error, not_found, see_other},
         page, route,
     },
     view::{View, view},
@@ -33,8 +33,23 @@ use crate::flash;
 use crate::models::{Account, User};
 use crate::views::{csrf_field, flash_banner};
 
+/// Whether this installation accepts new workspaces.
+///
+/// Read on every request rather than captured at startup, so the decision lives
+/// in one place (`Config::allow_signup`) and both the page and the handler obey
+/// it.
+fn signup_allowed(cx: &Cx) -> bool {
+    config_of(cx).allow_signup
+}
+
 #[page("/signup")]
-async fn signup_form() -> Result<impl View> {
+async fn signup_form(cx: &Cx) -> Result<impl View> {
+    if !signup_allowed(cx) {
+        // A 404 rather than a 403: an installation that does not take sign-ups
+        // should not advertise that it might.
+        return Err(not_found().into());
+    }
+
     Ok(view! {
         <div class="auth-card">
             <h1>"Create a workspace"</h1>
@@ -106,6 +121,9 @@ pub struct SignupForm {
 #[route(POST "/signup")]
 async fn signup(cx: &Cx, body: crate::csrf::CsrfForm<SignupForm>) -> Result<SeeOther> {
     let crate::csrf::CsrfForm(form) = body;
+    if !signup_allowed(cx) {
+        return Err(not_found().into());
+    }
     let config = config_of(cx);
     let mut db = crate::db(cx);
 

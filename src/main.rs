@@ -54,13 +54,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         redact(&config.database_url),
         config.time_zone,
     );
-    // Sign-up is how a fresh installation is entered, so it is worth naming
-    // rather than leaving somebody staring at a login form with no account.
-    // Built from the same variables Topcoat itself reads, so the line points at
+    // Say where to start, without advertising a door that is closed. The host
+    // and port are the same variables Topcoat reads, so the line points at
     // where the server is actually listening.
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    println!("sign up at http://{host}:{port}/signup to create the first workspace");
+    if config.allow_signup {
+        println!("sign up at http://{host}:{port}/signup to create a workspace");
+    } else {
+        println!(
+            "CRM_ALLOW_SIGNUP=0, so /signup is closed; sign in at \
+             http://{host}:{port}/login"
+        );
+    }
 
     let db = Db::builder()
         .models(toasty::models!(crm_light::*))
