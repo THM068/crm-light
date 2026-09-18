@@ -30,6 +30,7 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (config, warnings) = Config::from_env()?;
+    println!("{:#?}", config);
     let config = Arc::new(config);
 
     // The dashboard's aggregates are PostgreSQL SQL and the search asks for
@@ -68,6 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+  
     let db = Db::builder()
         .models(toasty::models!(crm_light::*))
         .connect(&config.database_url)
