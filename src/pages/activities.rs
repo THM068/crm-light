@@ -14,10 +14,11 @@ use topcoat::{
     },
 };
 
+use crate::access::{self, Tenant};
 use crate::auth;
 use crate::db;
 use crate::domain::{self, ActivityKind};
-use crate::models::Activity;
+use crate::models::{Activity, Company, Contact, Deal};
 use crate::pages::creator;
 
 path_param!(activity_id: i64, error = bad_request("Activity id must be a number"));
@@ -43,6 +44,8 @@ fn form_id(value: String) -> Option<i64> {
 
 #[route(POST "/activities")]
 async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ActivityForm>) -> Result<SeeOther> {
+    let tenant = Tenant::of(cx)?;
+
     auth::require_user(cx)?;
     let crate::csrf::CsrfForm(input) = body;
 
@@ -51,11 +54,28 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ActivityForm>) -> Result<Se
         return Err(bad_request("Activity note is required").into());
     }
 
-    let company_id = form_id(input.company_id);
-    let contact_id = form_id(input.contact_id);
-    let deal_id = form_id(input.deal_id);
+    // Every association the form named must be in this workspace: an activity
+    // is a note *about* a record, and pointing one at another tenant's company
+    // would both leak that the row exists and attach a note nobody else can
+    // see.
+    let company_id = access::require_reference::<Company>(
+        &mut db(cx),
+        tenant.account_id,
+        form_id(input.company_id),
+    )
+    .await?;
+    let contact_id = access::require_reference::<Contact>(
+        &mut db(cx),
+        tenant.account_id,
+        form_id(input.contact_id),
+    )
+    .await?;
+    let deal_id =
+        access::require_reference::<Deal>(&mut db(cx), tenant.account_id, form_id(input.deal_id))
+            .await?;
 
     toasty::create!(Activity {
+        account_id: tenant.account_id,
         kind: ActivityKind::from_stored(input.kind.trim()).as_str(),
         body,
         company_id,
@@ -86,12 +106,13 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ActivityForm>) -> Result<Se
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     auth::require_user(cx)?;
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let id = *path_param::<ActivityId>(cx)?;
 
-    let activity = Activity::filter(Activity::fields().id().eq(id))
-        .first()
-        .exec(&mut db)
-        .await?;
+    // Refused before the delete, so a cross-tenant id cannot remove a row.
+    let activity = access::require::<Activity>(&mut db, tenant.account_id, id).await?;
+    let activity = Some(activity);
 
     let back = match &activity {
         Some(activity) if activity.deal_id.is_some() => {

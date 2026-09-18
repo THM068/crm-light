@@ -22,12 +22,13 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        error::{RouterErrorExt, SeeOther, bad_request, forbidden, internal_server_error, see_other},
+        error::{SeeOther, bad_request, forbidden, internal_server_error, see_other},
         page, path_param, route,
     },
     view::{View, component, view},
 };
 
+use crate::access::{self, Tenant};
 use crate::auth::{self};
 use crate::domain::{self, Role};
 use crate::flash;
@@ -58,22 +59,25 @@ struct Row {
     live_sessions: usize,
 }
 
-/// Load an account or answer 404.
-async fn find(db: &mut Db, id: i64) -> Result<User> {
-    User::filter(User::fields().id().eq(id))
-        .first()
-        .exec(db)
-        .await?
-        .ok_or_not_found()
-        .map_err(Into::into)
+/// Load a member of this workspace, or 403/404.
+///
+/// `User` is tenant-owned like everything else, which is what makes an
+/// administrator's powers stop at their own workspace: an id from another one
+/// is refused before any of the rules below see it.
+async fn find(db: &mut Db, tenant: Tenant, id: i64) -> Result<User> {
+    access::require::<User>(db, tenant.account_id, id).await
 }
 
-/// How many *other* active administrators exist.
-async fn other_active_admins(db: &mut Db, excluding: i64) -> Result<usize> {
+/// How many *other* active administrators this workspace has.
+///
+/// Scoped, so an administrator in one workspace cannot be kept in place by the
+/// existence of an administrator in another.
+async fn other_active_admins(db: &mut Db, tenant: Tenant, excluding: i64) -> Result<usize> {
     let admins = User::filter(
         User::fields()
-            .role()
-            .eq(Role::Admin.as_str())
+            .account_id()
+            .eq(tenant.account_id)
+            .and(User::fields().role().eq(Role::Admin.as_str()))
             .and(User::fields().active().eq(true))
             .and(User::fields().id().ne(excluding)),
     )
@@ -116,10 +120,12 @@ fn guard_admin_change(
 #[page("/admin/users")]
 async fn index(cx: &Cx) -> Result<impl View> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let current = auth::require_admin(cx)?;
     let zone = crate::views::zone(cx);
 
-    let users = User::all()
+    let users = User::filter(User::fields().account_id().eq(tenant.account_id))
         .order_by(User::fields().username_lower().asc())
         .limit(PAGE_SIZE)
         .exec(&mut db)
@@ -130,14 +136,20 @@ async fn index(cx: &Cx) -> Result<impl View> {
         // Counted per row, which is honest about the cost: this list is bounded
         // by `PAGE_SIZE`, and an administrator looking at accounts is not the
         // hot path the CRM lists are.
-        let activity_count = Activity::filter(Activity::fields().user_id().eq(Some(user.id)))
-            .count()
-            .exec(&mut db)
-            .await?;
+        let activity_count = Activity::filter(
+            Activity::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Activity::fields().user_id().eq(Some(user.id))),
+        )
+        .count()
+        .exec(&mut db)
+        .await?;
         let live_sessions = Session::filter(
             Session::fields()
-                .user_id()
-                .eq(user.id)
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Session::fields().user_id().eq(user.id))
                 .and(Session::fields().revoked_at().is_none())
                 .and(Session::fields().expires_at().gt(domain::now())),
         )
@@ -282,6 +294,8 @@ struct NewUserForm {
 #[route(POST "/admin/users")]
 async fn create(cx: &Cx, body: crate::csrf::CsrfForm<NewUserForm>) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(form) = body;
     auth::require_admin(cx)?;
     let config = crate::config_of(cx);
@@ -294,13 +308,10 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<NewUserForm>) -> Result<See
         .into());
     }
     let key = domain::normalize_username(username);
-    if User::filter(User::fields().username_lower().eq(key.clone()))
-        .first()
-        .exec(&mut db)
-        .await?
-        .is_some()
-    {
-        return Err(bad_request("That username is already taken.").into());
+    // Per workspace, so another workspace having an `admin` does not stop this
+    // one having one either.
+    if access::username_taken(&mut db, tenant.account_id, &key).await? {
+        return Err(bad_request("Someone in this workspace already has that username.").into());
     }
 
     // A new account always gets a password: the whole point of an account is
@@ -325,6 +336,7 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<NewUserForm>) -> Result<See
     }
 
     let user = toasty::create!(User {
+        account_id: tenant.account_id,
         username,
         username_lower: key,
         display_name: domain::opt(form.display_name),
@@ -352,27 +364,40 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<NewUserForm>) -> Result<See
 #[page("/admin/users/{user_id}")]
 async fn show(cx: &Cx) -> Result<impl View> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let current = auth::require_admin(cx)?;
     let id = *path_param::<UserId>(cx)?;
-    let user = find(&mut db, id).await?;
+    let user = find(&mut db, tenant, id).await?;
 
     let zone = crate::views::zone(cx);
-    let activity_count = Activity::filter(Activity::fields().user_id().eq(Some(id)))
-        .count()
-        .exec(&mut db)
-        .await?;
+    let activity_count = Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().user_id().eq(Some(id))),
+    )
+    .count()
+    .exec(&mut db)
+    .await?;
     let sessions = Session::filter(
         Session::fields()
-            .user_id()
-            .eq(id)
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Session::fields().user_id().eq(id))
             .and(Session::fields().revoked_at().is_none())
             .and(Session::fields().expires_at().gt(domain::now())),
     )
     .order_by(Session::fields().created_at().desc())
     .exec(&mut db)
     .await?;
-    let recent = Activity::filter(Activity::fields().user_id().eq(Some(id)))
-        .order_by(Activity::fields().created_at().desc())
+    let recent = Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().user_id().eq(Some(id))),
+    )
+    .order_by(Activity::fields().created_at().desc())
         .limit(10)
         .exec(&mut db)
         .await?;
@@ -535,9 +560,11 @@ async fn show(cx: &Cx) -> Result<impl View> {
 #[page("/admin/users/{user_id}/edit")]
 async fn edit_form(cx: &Cx) -> Result<impl View> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     auth::require_admin(cx)?;
     let id = *path_param::<UserId>(cx)?;
-    let user = find(&mut db, id).await?;
+    let user = find(&mut db, tenant, id).await?;
 
     Ok(view! {
         <div class="page-head">
@@ -572,11 +599,13 @@ struct EditUserForm {
 #[route(POST "/admin/users/{user_id}")]
 async fn update_user(cx: &Cx, body: crate::csrf::CsrfForm<EditUserForm>) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(form) = body;
     let current = auth::require_admin(cx)?;
     let config = crate::config_of(cx);
     let id = *path_param::<UserId>(cx)?;
-    let mut user = find(&mut db, id).await?;
+    let mut user = find(&mut db, tenant, id).await?;
 
     let role = Role::parse(form.role.trim())
         .ok_or_else(|| bad_request("Unknown role."))?;
@@ -588,7 +617,7 @@ async fn update_user(cx: &Cx, body: crate::csrf::CsrfForm<EditUserForm>) -> Resu
     let closing = user.active && !active;
 
     if role_changed || closing {
-        let others = other_active_admins(&mut db, user.id).await?;
+        let others = other_active_admins(&mut db, tenant, user.id).await?;
         let self_harm = user.id == current.id;
         guard_admin_change(&current, &user, self_harm, others)?;
     }
@@ -627,15 +656,17 @@ struct ActiveForm {
 #[route(POST "/admin/users/{user_id}/active")]
 async fn set_active(cx: &Cx, body: crate::csrf::CsrfForm<ActiveForm>) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(form) = body;
     let current = auth::require_admin(cx)?;
     let config = crate::config_of(cx);
     let id = *path_param::<UserId>(cx)?;
-    let mut user = find(&mut db, id).await?;
+    let mut user = find(&mut db, tenant, id).await?;
 
     let active = form.active.trim() != "0";
     if user.active && !active {
-        let others = other_active_admins(&mut db, user.id).await?;
+        let others = other_active_admins(&mut db, tenant, user.id).await?;
         guard_admin_change(&current, &user, user.id == current.id, others)?;
     }
 
@@ -668,11 +699,13 @@ struct ResetPasswordForm {
 #[route(POST "/admin/users/{user_id}/password")]
 async fn reset_password(cx: &Cx, body: crate::csrf::CsrfForm<ResetPasswordForm>) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(form) = body;
     let current = auth::require_admin(cx)?;
     let config = crate::config_of(cx);
     let id = *path_param::<UserId>(cx)?;
-    let mut user = find(&mut db, id).await?;
+    let mut user = find(&mut db, tenant, id).await?;
 
     if let Some(problem) = auth::password_problem(&form.password) {
         return Err(bad_request(problem).into());
@@ -702,10 +735,12 @@ async fn reset_password(cx: &Cx, body: crate::csrf::CsrfForm<ResetPasswordForm>)
 #[route(POST "/admin/users/{user_id}/sessions/revoke")]
 async fn revoke_sessions(cx: &Cx) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let current = auth::require_admin(cx)?;
     let config = crate::config_of(cx);
     let id = *path_param::<UserId>(cx)?;
-    let user = find(&mut db, id).await?;
+    let user = find(&mut db, tenant, id).await?;
 
     let except = (user.id == current.id).then(|| auth::session_token(cx)).flatten();
     let revoked = auth::revoke_user_sessions(&mut db, user.id, except.as_deref())
@@ -724,23 +759,30 @@ async fn revoke_sessions(cx: &Cx) -> Result<SeeOther> {
 #[route(POST "/admin/users/{user_id}/delete")]
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     let mut db = crate::db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let current = auth::require_admin(cx)?;
     let config = crate::config_of(cx);
     let id = *path_param::<UserId>(cx)?;
-    let user = find(&mut db, id).await?;
+    let user = find(&mut db, tenant, id).await?;
 
     if user.id == current.id {
         return Err(forbidden().into());
     }
-    let others = other_active_admins(&mut db, user.id).await?;
+    let others = other_active_admins(&mut db, tenant, user.id).await?;
     guard_admin_change(&current, &user, false, others)?;
 
     // Accounts with history are closed, never deleted, so the activity log
     // keeps naming someone who existed.
-    let activity_count = Activity::filter(Activity::fields().user_id().eq(Some(id)))
-        .count()
-        .exec(&mut db)
-        .await?;
+    let activity_count = Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().user_id().eq(Some(id))),
+    )
+    .count()
+    .exec(&mut db)
+    .await?;
     if activity_count > 0 {
         return Err(bad_request(
             "This account has logged activity, so it cannot be deleted. Close it instead.",
@@ -749,20 +791,36 @@ async fn destroy(cx: &Cx) -> Result<SeeOther> {
     }
 
     // Sessions go with the account; the rows would otherwise be unreachable.
-    for session in Session::filter(Session::fields().user_id().eq(id))
-        .exec(&mut db)
-        .await?
+    // Scoped even though `id` was already checked to be in this workspace: a
+    // delete is the wrong place to rely on an earlier check having been made.
+    for session in Session::filter(
+        Session::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Session::fields().user_id().eq(id)),
+    )
+    .exec(&mut db)
+    .await?
     {
         Session::delete_by_id(&mut db, session.id).await?;
     }
-    crate::models::LoginAttempt::filter(
+    // The throttle row goes with the account, so a new person reusing the
+    // username does not inherit somebody else's lockout.
+    for attempt in crate::models::LoginAttempt::filter(
         crate::models::LoginAttempt::fields()
-            .username_lower()
-            .eq(domain::normalize_username(&user.username)),
+            .account_id()
+            .eq(tenant.account_id)
+            .and(
+                crate::models::LoginAttempt::fields()
+                    .username_lower()
+                    .eq(domain::normalize_username(&user.username)),
+            ),
     )
-    .delete()
     .exec(&mut db)
-    .await?;
+    .await?
+    {
+        crate::models::LoginAttempt::delete_by_id(&mut db, attempt.id).await?;
+    }
 
     User::delete_by_id(&mut db, id).await?;
 

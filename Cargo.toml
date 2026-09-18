@@ -49,3 +49,4 @@ jiff = "0.2"
 anyhow = "1"
 
 toasty-cli = { version = "0.10.0", optional = true }
+deunicode = "1.6.2"

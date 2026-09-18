@@ -25,6 +25,7 @@ use topcoat::{
     view::{View, view},
 };
 
+use crate::access::Tenant;
 use crate::auth;
 use crate::db;
 use crate::domain::{self, Stage};
@@ -61,18 +62,33 @@ struct PipelineTotals {
 async fn dashboard(cx: &Cx) -> Result<impl View> {
     auth::require_user(cx)?;
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let zone = crate::views::zone(cx);
     let page_size = crate::config_of(cx).page_size;
 
-    let company_count = Company::all().count().exec(&mut db).await?;
-    let contact_count = Contact::all().count().exec(&mut db).await?;
-    let activity_total = Activity::all().count().exec(&mut db).await? as usize;
+    // Every figure on this page is scoped to the workspace. The aggregates are
+    // raw SQL, so the tenant is a bound parameter rather than a query builder
+    // clause: `$1` is the account id throughout, and the typed counts carry the
+    // filter explicitly.
+    let scope = Company::fields().account_id().eq(tenant.account_id);
+    let company_count = Company::all().filter(scope).count().exec(&mut db).await?;
+    let contact_count = Contact::all()
+        .filter(Contact::fields().account_id().eq(tenant.account_id))
+        .count()
+        .exec(&mut db)
+        .await?;
+    let activity_total = Activity::all()
+        .filter(Activity::fields().account_id().eq(tenant.account_id))
+        .count()
+        .exec(&mut db)
+        .await? as usize;
 
-    let totals = pipeline_totals(&mut db).await?;
+    let totals = pipeline_totals(&mut db, tenant).await?;
 
     // Grouped by stage in one query, then laid out in the canonical order so
     // the table reads the same way the pipeline flows.
-    let by_stage = stage_totals(&mut db).await?;
+    let by_stage = stage_totals(&mut db, tenant).await?;
     let rows: Vec<StageRow> = Stage::ALL
         .into_iter()
         .map(|stage| {
@@ -96,7 +112,7 @@ async fn dashboard(cx: &Cx) -> Result<impl View> {
         SORT,
     )
     .offset;
-    let recent = Activity::all()
+    let recent = Activity::filter(Activity::fields().account_id().eq(tenant.account_id))
         .order_by(Activity::fields().id().desc())
         .limit(pagination::fetch_limit(page_size))
         .offset(offset)
@@ -178,15 +194,16 @@ async fn dashboard(cx: &Cx) -> Result<impl View> {
 }
 
 /// Counts and cash for the whole pipeline, in one pass over the deals table.
-async fn pipeline_totals(db: &mut toasty::Db) -> Result<PipelineTotals> {
-    // The two "won"/"lost" literals and the open set are bound as parameters
-    // rather than interpolated, so the SQL text is a constant.
+///
+/// `$1` is the account id and `$2`/`$3` are the closed stages, so the SQL text
+/// is a constant and the tenant is a bound value rather than an interpolation.
+async fn pipeline_totals(db: &mut toasty::Db, tenant: Tenant) -> Result<PipelineTotals> {
     let open_stages: Vec<String> = Stage::ALL
         .into_iter()
         .filter(|stage| stage.is_open())
         .map(|stage| stage.as_str().to_string())
         .collect();
-    let open_markers = placeholders(open_stages.len(), 3);
+    let open_markers = placeholders(open_stages.len(), 4);
 
     // `CAST(… AS BIGINT)` matters: PostgreSQL's `SUM` over a `BIGINT` returns
     // `NUMERIC`, which the driver cannot decode without its decimal feature.
@@ -195,11 +212,12 @@ async fn pipeline_totals(db: &mut toasty::Db) -> Result<PipelineTotals> {
     let sql = format!(
         "SELECT CAST(COUNT(*) AS BIGINT), \
          CAST(COALESCE(SUM(CASE WHEN stage IN ({open_markers}) THEN value_cents ELSE 0 END), 0) AS BIGINT), \
-         CAST(COALESCE(SUM(CASE WHEN stage = $1 THEN value_cents ELSE 0 END), 0) AS BIGINT) \
-         FROM deals"
+         CAST(COALESCE(SUM(CASE WHEN stage = $2 THEN value_cents ELSE 0 END), 0) AS BIGINT) \
+         FROM deals WHERE account_id = $1"
     );
 
     let mut query = toasty::sql::query(sql)
+        .bind(tenant.account_id)
         .bind(Stage::Won.as_str())
         .bind(Stage::Lost.as_str());
     for stage in &open_stages {
@@ -225,7 +243,7 @@ async fn pipeline_totals(db: &mut toasty::Db) -> Result<PipelineTotals> {
     let total = int_at(record, 0);
     let open_value = int_at(record, 1);
     let won_value = int_at(record, 2);
-    let closed = closed_count(db).await?;
+    let closed = closed_count(db, tenant).await?;
 
     Ok(PipelineTotals {
         open_deals: total - closed,
@@ -234,11 +252,13 @@ async fn pipeline_totals(db: &mut toasty::Db) -> Result<PipelineTotals> {
     })
 }
 
-/// How many deals sit in a closed stage.
-async fn closed_count(db: &mut toasty::Db) -> Result<i64> {
+/// How many deals in this workspace sit in a closed stage.
+async fn closed_count(db: &mut toasty::Db, tenant: Tenant) -> Result<i64> {
     let rows = toasty::sql::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) FROM deals WHERE stage IN ($1, $2)",
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM deals \
+         WHERE account_id = $1 AND stage IN ($2, $3)",
     )
+    .bind(tenant.account_id)
     .bind(Stage::Won.as_str())
     .bind(Stage::Lost.as_str())
     .column_types([toasty::stmt::Type::I64])
@@ -253,13 +273,14 @@ async fn closed_count(db: &mut toasty::Db) -> Result<i64> {
         .unwrap_or(0))
 }
 
-/// Deal count and total value per stage, keyed by the stored stage string.
-async fn stage_totals(db: &mut toasty::Db) -> Result<HashMap<String, (i64, i64)>> {
+/// Deal count and total value per stage in this workspace.
+async fn stage_totals(db: &mut toasty::Db, tenant: Tenant) -> Result<HashMap<String, (i64, i64)>> {
     let rows = toasty::sql::query(
         "SELECT stage, CAST(COUNT(*) AS BIGINT), \
          CAST(COALESCE(SUM(value_cents), 0) AS BIGINT) \
-         FROM deals GROUP BY stage",
+         FROM deals WHERE account_id = $1 GROUP BY stage",
     )
+    .bind(tenant.account_id)
     .column_types([
         toasty::stmt::Type::String,
         toasty::stmt::Type::I64,

@@ -15,11 +15,19 @@
 //! extractor, so the token check cannot be forgotten; every mutating handler
 //! takes a `CurrentUser` — usually via [`auth::require_user`] — and records it
 //! on the row it writes.
+//!
+//! # Tenancy
+//!
+//! A request is scoped to one workspace, carried in [`auth::CurrentUser`] as
+//! `account_id`. Reads of tenant-owned data go through [`access`], which
+//! enforces the filter and decides between a 403 and a 404; the layout's error
+//! boundary below turns either into a styled page.
 
 // Topcoat components receive every value they render as a named argument, so
 // the create/edit forms legitimately exceed clippy's default arity threshold.
 #![allow(clippy::too_many_arguments)]
 
+pub mod access;
 pub mod auth;
 pub mod config;
 pub mod csrf;
@@ -37,7 +45,7 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     router::{Slot, content::Css, layout, route},
-    view::{View, view},
+    view::{View, error_boundary, view},
 };
 
 /// Everything a handler needs that is resolved once at startup.
@@ -66,11 +74,21 @@ pub fn config_of(cx: &Cx) -> &config::Config {
 }
 
 /// The single layout wrapping every page.
+///
+/// It also catches the errors that deserve a page of their own: a 403 from
+/// [`access`] when a request reaches outside its workspace, and a 404 for a URL
+/// that matches nothing (which reaches here because of `not_found!("/")` in
+/// `pages::not_found`). Catching them in one place means every page gets the
+/// same treatment without each handler remembering to render it.
 #[layout("/")]
 async fn root(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let user = auth::current_user(cx);
     let flash = flash::peek(cx);
     let signed_in = user.is_some();
+    let account_name = user
+        .as_ref()
+        .map(|user| user.account_name.clone())
+        .unwrap_or_default();
 
     Ok(view! {
         <!DOCTYPE html>
@@ -85,6 +103,9 @@ async fn root(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             <body>
                 <header class="topbar">
                     <a class="brand" href="/">"crm-light"</a>
+                    if signed_in {
+                        <span class="workspace" title="Your workspace">(account_name)</span>
+                    }
                     if signed_in {
                         <nav>
                             <a href="/">"Dashboard"</a>
@@ -111,7 +132,10 @@ async fn root(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     if let Some(flash) = flash {
                         views::flash_banner(kind: flash.kind.as_str(), message: &flash.message)
                     }
-                    (slot)
+                    error_boundary(
+                        fallback: |error| views::error_view(cx, error),
+                        (slot)
+                    )
                 </main>
             </body>
         </html>
@@ -299,6 +323,55 @@ textarea { min-height: 5rem; resize: vertical; }
   padding: 1.5rem;
 }
 .auth-card h1 { margin-bottom: 0.25rem; }
+.auth-card .hint { font-size: 0.82rem; color: var(--muted); }
+.auth-card code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: #f2f4f7;
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+
+.workspace {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink);
+  background: #eef1f5;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  white-space: nowrap;
+}
+
+.error-page {
+  max-width: 34rem;
+  margin: 4rem auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+}
+.error-code {
+  font-size: 3.5rem;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--line);
+}
+.error-page h1 { margin: 0.5rem 0 0.75rem; font-size: 1.6rem; }
+.error-lead { color: var(--muted); margin: 0 0 1rem; }
+.error-detail {
+  background: #fdf4f3;
+  border: 1px solid #f3d6d2;
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  color: #7d2b21;
+  font-size: 0.9rem;
+  text-align: left;
+  margin: 0 0 1.25rem;
+}
+.error-actions { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; }
 
 dl.meta { display: grid; grid-template-columns: 9rem 1fr; gap: 0.35rem 1rem; margin: 0; }
 dl.meta dt { color: var(--muted); font-size: 0.88rem; }

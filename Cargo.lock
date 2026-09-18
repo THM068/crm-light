@@ -567,6 +567,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "base64 0.22.1",
+ "deunicode",
  "hmac 0.12.1",
  "jiff",
  "rand 0.9.5",
@@ -754,6 +755,12 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+
+[[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 
 [[package]]
 name = "dialoguer"

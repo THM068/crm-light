@@ -51,7 +51,7 @@ use topcoat::{
 use crate::config::Config;
 use crate::csrf;
 use crate::domain::{self, Role};
-use crate::models::{LoginAttempt, Session, User};
+use crate::models::{Account, LoginAttempt, Session, User};
 
 /// Name of the cookie carrying the session token.
 pub const SESSION_COOKIE: &str = "crm_session";
@@ -83,19 +83,37 @@ const TOTP_SKEW_STEPS: i64 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentUser {
     pub id: i64,
+    /// The workspace this person belongs to. Every query they make is scoped to
+    /// it; see [`crate::access`].
+    pub account_id: i64,
     /// Username as stored, for display.
     pub username: String,
     pub display_name: Option<String>,
     pub role: Role,
+    /// The workspace's display name, for the chrome.
+    pub account_name: String,
+    /// The workspace's sign-in slug, which is what `/login` matches on.
+    pub account_slug: String,
 }
 
 impl CurrentUser {
-    pub fn from_model(user: &User) -> Self {
+    pub fn from_model(user: &User, account: &Account) -> Self {
         Self {
             id: user.id,
+            account_id: user.account_id,
             username: user.username.clone(),
             display_name: user.display_name.clone(),
             role: Role::from_stored(&user.role),
+            account_name: account.name.clone(),
+            account_slug: account.slug.clone(),
+        }
+    }
+
+    /// The tenant, as [`crate::access`] wants it.
+    pub fn tenant(&self) -> crate::access::Tenant {
+        crate::access::Tenant {
+            account_id: self.account_id,
+            user_id: self.id,
         }
     }
 
@@ -137,7 +155,11 @@ pub fn require_user(cx: &Cx) -> Result<CurrentUser> {
     current_user(cx).ok_or_else(|| unauthorized().into())
 }
 
-/// The signed-in user, or a 403 unless they are an administrator.
+/// The signed-in user, or a 403 unless they are an administrator **of their own
+/// workspace**.
+///
+/// The role is a per-tenant thing: an administrator manages the accounts in
+/// their workspace and has no standing in any other.
 ///
 /// # Errors
 ///
@@ -439,6 +461,7 @@ pub async fn create_session(
     db: &mut Db,
     config: &Config,
     user_id: i64,
+    account_id: i64,
     user_agent: Option<&str>,
     ip: Option<&str>,
 ) -> toasty::Result<String> {
@@ -447,6 +470,7 @@ pub async fn create_session(
 
     toasty::create!(Session {
         token_hash: token_hash(&token),
+        account_id,
         user_id,
         created_at: now,
         expires_at: now + config.session_ttl.as_secs() as i64,
@@ -460,11 +484,17 @@ pub async fn create_session(
     Ok(token)
 }
 
-/// Resolve a session token to its user, if the session is live.
+/// Resolve a session token to its user and workspace, if the session is live.
 ///
-/// Live means: the row exists, is not revoked, has not expired, and its user is
-/// still active. Anything else yields `None`.
-pub async fn resolve_session(db: &mut Db, token: &str) -> toasty::Result<Option<(Session, User)>> {
+/// Live means: the row exists, is not revoked, has not expired, its user is
+/// still active, and the session's `account_id` agrees with the user's. That
+/// last check is redundant with how sessions are created, and it is kept
+/// because it is the one place where a mismatch would silently widen a
+/// tenant's reach.
+pub async fn resolve_session(
+    db: &mut Db,
+    token: &str,
+) -> toasty::Result<Option<(Session, User, Account)>> {
     let digest = token_hash(token);
     let Some(session) = Session::filter(Session::fields().token_hash().eq(digest))
         .first()
@@ -490,7 +520,21 @@ pub async fn resolve_session(db: &mut Db, token: &str) -> toasty::Result<Option<
         return Ok(None);
     }
 
-    Ok(Some((session, user)))
+    // The session's tenant must agree with its user's, or the request would be
+    // scoped to a workspace its user is not in.
+    if session.account_id != user.account_id {
+        return Ok(None);
+    }
+
+    let Some(account) = Account::filter(Account::fields().id().eq(user.account_id))
+        .first()
+        .exec(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some((session, user, account)))
 }
 
 /// Revoke one session by token.
@@ -577,8 +621,14 @@ fn truncate(value: &str, max: usize) -> String {
 // --- Failed-login throttle --------------------------------------------------
 
 /// How long sign-in for this username stays refused, if it is locked.
-pub async fn login_lockout(db: &mut Db, username_lower: &str) -> toasty::Result<Option<i64>> {
-    let Some(attempt) = find_attempt(db, username_lower).await? else {
+///
+/// Scoped to the workspace, so one tenant cannot lock another's users out.
+pub async fn login_lockout(
+    db: &mut Db,
+    account_id: i64,
+    username_lower: &str,
+) -> toasty::Result<Option<i64>> {
+    let Some(attempt) = find_attempt(db, account_id, username_lower).await? else {
         return Ok(None);
     };
     match attempt.locked_until {
@@ -591,10 +641,11 @@ pub async fn login_lockout(db: &mut Db, username_lower: &str) -> toasty::Result<
 pub async fn record_login_failure(
     db: &mut Db,
     config: &Config,
+    account_id: i64,
     username_lower: &str,
 ) -> toasty::Result<()> {
     let now = domain::now();
-    match find_attempt(db, username_lower).await? {
+    match find_attempt(db, account_id, username_lower).await? {
         Some(mut attempt) => {
             let failures = attempt.failures + 1;
             let locked_until =
@@ -611,6 +662,7 @@ pub async fn record_login_failure(
             let locked_until =
                 (config.login_max_attempts <= 1).then(|| now + config.login_lockout.as_secs() as i64);
             toasty::create!(LoginAttempt {
+                account_id,
                 username_lower,
                 failures: 1,
                 locked_until,
@@ -624,18 +676,31 @@ pub async fn record_login_failure(
 }
 
 /// Clear the failure counter after a successful sign-in.
-pub async fn clear_login_failures(db: &mut Db, username_lower: &str) -> toasty::Result<()> {
-    if let Some(attempt) = find_attempt(db, username_lower).await? {
+pub async fn clear_login_failures(
+    db: &mut Db,
+    account_id: i64,
+    username_lower: &str,
+) -> toasty::Result<()> {
+    if let Some(attempt) = find_attempt(db, account_id, username_lower).await? {
         LoginAttempt::delete_by_id(db, attempt.id).await?;
     }
     Ok(())
 }
 
-async fn find_attempt(db: &mut Db, username_lower: &str) -> toasty::Result<Option<LoginAttempt>> {
+async fn find_attempt(
+    db: &mut Db,
+    account_id: i64,
+    username_lower: &str,
+) -> toasty::Result<Option<LoginAttempt>> {
     LoginAttempt::filter(
         LoginAttempt::fields()
-            .username_lower()
-            .eq(username_lower.to_string()),
+            .account_id()
+            .eq(account_id)
+            .and(
+                LoginAttempt::fields()
+                    .username_lower()
+                    .eq(username_lower.to_string()),
+            ),
     )
     .first()
     .exec(db)
@@ -656,9 +721,14 @@ pub fn secure_cookie(name: &str, value: String, config: &Config) -> Cookie<'stat
 }
 
 /// The session cookie for a freshly minted token.
+///
+/// The cookie carries the workspace slug as a second field so the sign-in form
+/// can be prefilled on the next visit: usernames are only unique inside a
+/// workspace, so the slug is half of the credential and asking for it twice
+/// would be a needless obstacle.
 #[must_use]
-pub fn session_cookie(token: String, config: &Config) -> Cookie<'static> {
-    let mut cookie = secure_cookie(SESSION_COOKIE, token, config);
+pub fn session_cookie(token: String, config: &Config, account_slug: &str) -> Cookie<'static> {
+    let mut cookie = secure_cookie(SESSION_COOKIE, format!("{token}|{account_slug}"), config);
     cookie.set_max_age(CookieDuration::seconds(config.session_ttl.as_secs() as i64));
     cookie
 }
@@ -677,10 +747,25 @@ pub fn clear_session_cookie() -> Cookie<'static> {
 /// Read the session token straight from the request headers.
 ///
 /// The guard runs outside the cookie layer, so it cannot use the cookie jar and
-/// parses the incoming `Cookie` headers itself.
+/// parses the incoming `Cookie` headers itself. The token and the workspace slug
+/// travel in one cookie, separated by a `|`, which cannot appear in either.
 #[must_use]
 pub fn session_token(cx: &Cx) -> Option<String> {
-    cookie_from_headers(cx, SESSION_COOKIE)
+    cookie_from_headers(cx, SESSION_COOKIE).map(|value| {
+        value
+            .split('|')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+/// The workspace slug the last sign-in used, for prefilling the login form.
+#[must_use]
+pub fn last_account_slug(cx: &Cx) -> Option<String> {
+    let raw = cookie_from_headers(cx, SESSION_COOKIE)?;
+    let (_, slug) = raw.split_once('|')?;
+    (!slug.is_empty()).then(|| slug.to_string())
 }
 
 /// Read one cookie value from the request's `Cookie` headers.
@@ -728,15 +813,16 @@ fn normalize_path(path: &str) -> &str {
     }
 }
 
-/// The sign-in page: the one route reachable without a session, and the one a
-/// signed-in request is turned away from.
+/// The pages a signed-in visitor is redirected away from.
 ///
-/// It is the *only* route with either property. Assets such as the stylesheet
-/// are reachable without a session too, but they are not routes to be navigated
-/// to, so they must keep working once a user has signed in.
+/// Sign-in and sign-up: somebody who already has a session has no business on
+/// either, and reaching `/signup` while signed in would otherwise create a
+/// second workspace by accident. Assets such as the stylesheet are reachable
+/// without a session too, but they are not pages to be navigated to, so they
+/// must keep working once somebody has signed in.
 #[must_use]
-pub fn is_login_path(path: &str) -> bool {
-    normalize_path(path) == "/login"
+pub fn redirects_when_signed_in(path: &str) -> bool {
+    matches!(normalize_path(path), "/login" | "/signup")
 }
 
 /// Whether an anonymous request may be served this path.
@@ -749,7 +835,10 @@ pub fn is_login_path(path: &str) -> bool {
 /// exactly where it is needed.
 #[must_use]
 pub fn reachable_without_session(path: &str) -> bool {
-    matches!(normalize_path(path), "/login" | "/style.css" | "/favicon.ico")
+    matches!(
+        normalize_path(path),
+        "/login" | "/signup" | "/style.css" | "/favicon.ico"
+    )
 }
 
 /// Rejects anonymous requests and installs [`CurrentUser`] for the rest.
@@ -800,7 +889,7 @@ impl Layer for Guard {
             let mut db = self.db.clone();
             let user = match token.as_deref().filter(|token| !token.is_empty()) {
                 Some(token) => match resolve_session(&mut db, token).await {
-                    Ok(Some((_, user))) => Some(user),
+                    Ok(Some((_, user, account))) => Some((user, account)),
                     Ok(None) => {
                         // Stale, revoked, expired, or a deactivated account:
                         // drop the cookie so the browser stops replaying it.
@@ -812,14 +901,14 @@ impl Layer for Guard {
                 None => None,
             };
 
-            let Some(user) = user else {
+            let Some((user, account)) = user else {
                 if reachable_without_session(&path) {
                     return next.run(&cx, body).await;
                 }
                 return redirect(Self::login_location(&cx)).into_response(&cx);
             };
 
-            if is_login_path(&path) {
+            if redirects_when_signed_in(&path) {
                 // Already signed in: send them on rather than showing the form.
                 // Every other anonymous-reachable path — the stylesheet above
                 // all — is served normally, or the page would render unstyled
@@ -846,7 +935,7 @@ impl Layer for Guard {
                 HeaderValue::from_static("same-origin"),
             );
 
-            let current = CurrentUser::from_model(&user);
+            let current = CurrentUser::from_model(&user, &account);
             next.run(&cx.with(current), body).await
         })
     }
@@ -1053,9 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_login_page_is_reachable_without_a_session() {
+    fn only_the_authentication_pages_are_reachable_without_a_session() {
         assert!(reachable_without_session("/login"));
         assert!(reachable_without_session("/login/"));
+        assert!(reachable_without_session("/signup"));
         assert!(reachable_without_session("/style.css"));
         assert!(reachable_without_session("/favicon.ico"));
         assert!(!reachable_without_session("/"));
@@ -1067,21 +1157,27 @@ mod tests {
     }
 
     #[test]
-    fn assets_stay_anonymous_but_are_not_login() {
+    fn assets_stay_anonymous_but_are_not_redirected_away() {
         // The distinction the guard turns on: `/style.css` is reachable without
         // a session *and* must keep being served with one. Treating the two
         // lists as one made the stylesheet 307 to `/` after sign-in, so every
         // page rendered unstyled.
         for asset in ["/style.css", "/favicon.ico"] {
             assert!(reachable_without_session(asset), "{asset}");
-            assert!(!is_login_path(asset), "{asset}");
+            assert!(!redirects_when_signed_in(asset), "{asset}");
         }
+    }
 
-        assert!(is_login_path("/login"));
-        assert!(is_login_path("/login/"));
-        assert!(!is_login_path("/"));
-        assert!(!is_login_path("/logins"));
-        assert!(!is_login_path("/admin/login"));
+    #[test]
+    fn the_authentication_pages_bounce_a_signed_in_visitor() {
+        assert!(redirects_when_signed_in("/login"));
+        assert!(redirects_when_signed_in("/login/"));
+        // Signing up while already signed in would quietly create a second
+        // workspace, so it bounces too.
+        assert!(redirects_when_signed_in("/signup"));
+        assert!(!redirects_when_signed_in("/"));
+        assert!(!redirects_when_signed_in("/logins"));
+        assert!(!redirects_when_signed_in("/admin/login"));
     }
 
     #[test]

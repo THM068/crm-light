@@ -22,7 +22,8 @@ use crate::auth::{self};
 use crate::config::Config;
 use crate::domain;
 use crate::flash;
-use crate::models::{Session, User};
+use crate::access;
+use crate::models::{Account, Session, User};
 use crate::views::{csrf_field, flash_banner};
 
 #[query_params(error = bad_request)]
@@ -43,6 +44,9 @@ async fn login_form(cx: &Cx) -> Result<impl View> {
         .next
         .clone()
         .and_then(|value| auth::safe_return_target(&value));
+    // Prefilled from the last sign-in on this browser, so most people never
+    // have to think about the workspace field.
+    let workspace = auth::last_account_slug(cx).unwrap_or_default();
 
     Ok(view! {
         <div class="auth-card">
@@ -58,8 +62,18 @@ async fn login_form(cx: &Cx) -> Result<impl View> {
                 csrf_field()
                 <input type="hidden" name="next" value=(next.clone().unwrap_or_default())>
                 <div class="field">
+                    <label for="workspace">"Workspace"</label>
+                    <input id="workspace" name="workspace" value=(workspace) autofocus=""
+                           autocapitalize="none" autocorrect="off" spellcheck="false" required=""
+                           placeholder="acme-robotics">
+                    <span class="hint">
+                        "The sign-in name your workspace was created with. Usernames are unique \
+                         per workspace, so this is how we know which one you mean."
+                    </span>
+                </div>
+                <div class="field">
                     <label for="username">"Username"</label>
-                    <input id="username" name="username" autofocus="" autocomplete="username" required="">
+                    <input id="username" name="username" autocomplete="username" required="">
                 </div>
                 <div class="field">
                     <label for="password">"Password"</label>
@@ -72,12 +86,16 @@ async fn login_form(cx: &Cx) -> Result<impl View> {
                 </div>
                 <button class="btn btn-primary" type="submit">"Sign in"</button>
             </form>
+
+            <p class="muted">"No workspace yet? " <a href="/signup">"Create one"</a></p>
         </div>
     })
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
+    #[serde(default)]
+    workspace: String,
     #[serde(default)]
     username: String,
     #[serde(default)]
@@ -94,7 +112,7 @@ struct LoginForm {
 /// collapse into one response, so a wrong password, an unknown username, and a
 /// closed account cannot be told apart from the outside.
 enum Attempt {
-    Ok(Box<User>),
+    Ok(Box<User>, Box<Account>),
     BadCredentials,
     Locked(i64),
     PasswordlessDisabled,
@@ -104,6 +122,14 @@ enum Attempt {
 }
 
 /// The whole sign-in decision, with no HTTP in it.
+///
+/// # Tenant resolution comes first
+///
+/// The workspace is looked up before the username, because a username only
+/// means anything inside one. A wrong workspace and a wrong username give the
+/// same answer — the throttle is per workspace, and the failure is counted
+/// against the username the caller claimed — so this cannot be used to discover
+/// which workspaces exist beyond the fact that a slug was accepted.
 async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attempt {
     let username = form.username.trim();
     if username.is_empty() {
@@ -111,16 +137,44 @@ async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attemp
     }
     let key = domain::normalize_username(username);
 
-    match auth::login_lockout(db, &key).await {
+    let slug = access::slugify(&form.workspace);
+    if slug.is_empty() {
+        return Attempt::BadCredentials;
+    }
+    // Named `workspace` rather than `account`: `#[page("/account")]` below
+    // generates a unit struct called `account` in this module, so a local
+    // binding of that name would resolve to the struct instead of the row.
+    let workspace = match Account::filter(Account::fields().slug().eq(slug))
+        .first()
+        .exec(db)
+        .await
+    {
+        Ok(workspace) => workspace,
+        Err(error) => return Attempt::Db(error),
+    };
+    let Some(workspace) = workspace else {
+        // Spend the same time as a real verification, so neither the response
+        // time nor the message says whether the workspace exists.
+        auth::dummy_password_check(&form.password);
+        return Attempt::BadCredentials;
+    };
+    let account_id = workspace.id;
+
+    match auth::login_lockout(db, account_id, &key).await {
         Ok(Some(remaining)) => return Attempt::Locked(remaining),
         Ok(None) => {}
         Err(error) => return Attempt::Db(error),
     }
 
-    let user = match User::filter(User::fields().username_lower().eq(key.clone()))
-        .first()
-        .exec(db)
-        .await
+    let user = match User::filter(
+        User::fields()
+            .account_id()
+            .eq(account_id)
+            .and(User::fields().username_lower().eq(key.clone())),
+    )
+    .first()
+    .exec(db)
+    .await
     {
         Ok(user) => user,
         Err(error) => return Attempt::Db(error),
@@ -130,7 +184,7 @@ async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attemp
         // Spend the same time as a real verification, so the response time does
         // not reveal whether the username exists.
         auth::dummy_password_check(&form.password);
-        if let Err(error) = auth::record_login_failure(db, config, &key).await {
+        if let Err(error) = auth::record_login_failure(db, config, account_id, &key).await {
             return Attempt::Db(error);
         }
         return Attempt::BadCredentials;
@@ -140,7 +194,7 @@ async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attemp
     // that an account exists is itself worth something to an attacker.
     if !user.active {
         auth::dummy_password_check(&form.password);
-        if let Err(error) = auth::record_login_failure(db, config, &key).await {
+        if let Err(error) = auth::record_login_failure(db, config, account_id, &key).await {
             return Attempt::Db(error);
         }
         return Attempt::BadCredentials;
@@ -160,7 +214,7 @@ async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attemp
     };
 
     if !password_ok {
-        if let Err(error) = auth::record_login_failure(db, config, &key).await {
+        if let Err(error) = auth::record_login_failure(db, config, account_id, &key).await {
             return Attempt::Db(error);
         }
         return Attempt::BadCredentials;
@@ -171,17 +225,17 @@ async fn attempt_login(db: &mut Db, config: &Config, form: &LoginForm) -> Attemp
             return Attempt::TotpRequired;
         }
         if !auth::verify_totp(secret, &form.totp, domain::now()) {
-            if let Err(error) = auth::record_login_failure(db, config, &key).await {
+            if let Err(error) = auth::record_login_failure(db, config, account_id, &key).await {
                 return Attempt::Db(error);
             }
             return Attempt::TotpWrong;
         }
     }
 
-    if let Err(error) = auth::clear_login_failures(db, &key).await {
+    if let Err(error) = auth::clear_login_failures(db, account_id, &key).await {
         return Attempt::Db(error);
     }
-    Attempt::Ok(Box::new(user))
+    Attempt::Ok(Box::new(user), Box::new(workspace))
 }
 
 #[route(POST "/login")]
@@ -190,8 +244,8 @@ async fn login(cx: &Cx, body: crate::csrf::CsrfForm<LoginForm>) -> Result<SeeOth
     let crate::csrf::CsrfForm(form) = body;
     let mut db = crate::db(cx);
 
-    let mut user = match attempt_login(&mut db, config, &form).await {
-        Attempt::Ok(user) => *user,
+    let (mut user, workspace) = match attempt_login(&mut db, config, &form).await {
+        Attempt::Ok(user, workspace) => (*user, *workspace),
         Attempt::Locked(remaining) => {
             return Err(bad_request(format!(
                 "Too many failed sign-in attempts for that account. Try again in {}.",
@@ -232,6 +286,7 @@ async fn login(cx: &Cx, body: crate::csrf::CsrfForm<LoginForm>) -> Result<SeeOth
         &mut db,
         config,
         user.id,
+        workspace.id,
         user_agent.as_deref(),
         ip.as_deref(),
     )
@@ -243,7 +298,7 @@ async fn login(cx: &Cx, body: crate::csrf::CsrfForm<LoginForm>) -> Result<SeeOth
         .exec(&mut db)
         .await?;
 
-    auth::set_cookie_header(cx, auth::session_cookie(token, config));
+    auth::set_cookie_header(cx, auth::session_cookie(token, config, &workspace.slug));
 
     Ok(see_other(landing(Some(&form.next))))
 }

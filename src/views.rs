@@ -9,9 +9,11 @@ use std::collections::HashMap;
 use topcoat::{
     Result,
     context::{Cx, app_context},
-    view::{View, component, view},
+    router::StatusCode,
+    view::{BoxView, View, component, view},
 };
 
+use crate::access;
 use crate::auth;
 use crate::csrf;
 use crate::domain::{self, ActivityKind, Role, Stage, TimeZone};
@@ -65,6 +67,82 @@ pub async fn form_errors(errors: Vec<String>) -> Result<impl View> {
             </div>
         }
     })
+}
+
+// --- Error pages -----------------------------------------------------------
+
+/// Turn a bubbled-up error into the page it deserves.
+///
+/// Called by the layout's `error_boundary` for every failure a handler or the
+/// router produced. The cases worth a page of their own are a 403, a 404, and a
+/// bad request; anything else is rethrown, so the router answers a bare 500
+/// rather than rendering an internal message into the page.
+///
+/// The `StatusCode` inside the returned view is what keeps the response's status
+/// honest — without it the replacement page would be served as a 200, telling a
+/// crawler or a monitor that a missing page was fine.
+///
+/// This is a plain function rather than a `#[component]`, because
+/// `error_boundary` takes a closure and a component is only callable from
+/// inside a `view!` body. The `cx =>` prefix tells `view!` which context to
+/// render against, which is otherwise supplied by the component macro. Boxing
+/// is what lets the three differently-shaped pages share one return type; each
+/// is rendered once and never polled again, so the allocation buys nothing but
+/// the type.
+pub fn error_view(cx: &Cx, error: topcoat::Error) -> Result<BoxView<'_>> {
+    let signed_in = auth::current_user(cx).is_some();
+
+    let (status, heading, explanation, detail): (StatusCode, &str, &str, Option<String>) =
+        if access::is_forbidden(&error) {
+            (
+                StatusCode::FORBIDDEN,
+                "Not your workspace",
+                "This record belongs to a different workspace, so it is not yours to see or \
+                 change. Everything you do have access to is in your own workspace.",
+                access::forbidden_message(&error),
+            )
+        } else if access::is_not_found(&error) {
+            (
+                StatusCode::NOT_FOUND,
+                "Nothing here",
+                "That page does not exist. It may have been deleted, or the link may contain a \
+                 typo.",
+                None,
+            )
+        } else if let Some(message) = access::bad_request_message(&error) {
+            (
+                StatusCode::BAD_REQUEST,
+                "That did not work",
+                "The form could not be accepted as submitted.",
+                Some(message),
+            )
+        } else {
+            // Rethrow: an unexpected failure is a 500 with no explanatory text.
+            return Err(error);
+        };
+
+    Ok(Box::pin(view! {
+        cx =>
+        (status)
+        <div class="error-page">
+            <div class="error-code">(status.as_u16())</div>
+            <h1>(heading)</h1>
+            <p class="error-lead">(explanation)</p>
+            if let Some(detail) = detail {
+                <p class="error-detail">(detail)</p>
+            }
+            <div class="error-actions">
+                if signed_in {
+                    <a class="btn btn-primary" href="/">"Back to the dashboard"</a>
+                    <a class="btn" href="/companies">"Companies"</a>
+                    <a class="btn" href="/deals">"Deals"</a>
+                } else {
+                    <a class="btn btn-primary" href="/login">"Sign in"</a>
+                    <a class="btn" href="/signup">"Create a workspace"</a>
+                }
+            </div>
+        </div>
+    }))
 }
 
 // --- CRM widgets -----------------------------------------------------------

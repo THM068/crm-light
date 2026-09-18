@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::access::{self, Tenant};
 use crate::auth;
 use crate::db;
 use crate::domain::{self, Stage};
@@ -21,7 +22,7 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        error::{RouterErrorExt, SeeOther, bad_request, see_other},
+        error::{SeeOther, bad_request, see_other},
         page, path_param, query_params, route,
     },
     view::{View, component, view},
@@ -54,19 +55,14 @@ struct Row {
     close: String,
 }
 
-/// Load a deal or answer 404.
-async fn find(db: &mut toasty::Db, id: i64) -> Result<Deal> {
-    Deal::filter(Deal::fields().id().eq(id))
-        .first()
-        .exec(db)
-        .await?
-        .ok_or_not_found()
-        .map_err(Into::into)
+/// Load a deal for this workspace, or 403/404.
+async fn find(db: &mut toasty::Db, tenant: Tenant, id: i64) -> Result<Deal> {
+    access::require::<Deal>(db, tenant.account_id, id).await
 }
 
-/// `(id, label)` pairs for the company picker.
-async fn company_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
-    Ok(Company::all()
+/// `(id, label)` pairs for the company picker, scoped to the workspace.
+async fn company_options(db: &mut toasty::Db, tenant: Tenant) -> Result<Vec<(i64, String)>> {
+    Ok(Company::filter(Company::fields().account_id().eq(tenant.account_id))
         .order_by(Company::fields().name().asc())
         .exec(db)
         .await?
@@ -75,9 +71,9 @@ async fn company_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
         .collect())
 }
 
-/// `(id, label)` pairs for the contact picker.
-async fn contact_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
-    Ok(Contact::all()
+/// `(id, label)` pairs for the contact picker, scoped to the workspace.
+async fn contact_options(db: &mut toasty::Db, tenant: Tenant) -> Result<Vec<(i64, String)>> {
+    Ok(Contact::filter(Contact::fields().account_id().eq(tenant.account_id))
         .order_by(Contact::fields().last_name().asc())
         .exec(db)
         .await?
@@ -96,6 +92,8 @@ async fn contact_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
 #[page("/deals")]
 async fn index(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let filters = query_params::<ListQuery>(cx)?;
     let search = filters.q.clone().unwrap_or_default().trim().to_string();
     let page_size = crate::config_of(cx).page_size;
@@ -111,25 +109,21 @@ async fn index(cx: &Cx) -> Result<impl View> {
         .and_then(Stage::parse)
         .is_some();
 
-    // One filter value for both the count and the page query.
-    let mut filter = (!search.is_empty())
-        .then(|| Deal::fields().title().contains_ignoring_case(&search));
+    // One filter value for both the count and the page query, with the tenant
+    // clause built in rather than added later.
+    let mut filter = Deal::fields().account_id().eq(tenant.account_id);
+    if !search.is_empty() {
+        filter = filter.and(Deal::fields().title().contains_ignoring_case(&search));
+    }
     if stage_active {
-        let stage = Deal::fields().stage().eq(stage_filter.as_str());
-        filter = Some(match filter {
-            Some(title) => title.and(stage),
-            None => stage,
-        });
+        filter = filter.and(Deal::fields().stage().eq(stage_filter.as_str()));
     }
 
-    let total = match &filter {
-        Some(filter) => Deal::all()
-            .filter(filter.clone())
-            .count()
-            .exec(&mut db)
-            .await?,
-        None => Deal::all().count().exec(&mut db).await?,
-    } as usize;
+    let total = Deal::all()
+        .filter(filter.clone())
+        .count()
+        .exec(&mut db)
+        .await? as usize;
 
     let pagination = Pagination {
         next: filters.next.clone(),
@@ -138,11 +132,9 @@ async fn index(cx: &Cx) -> Result<impl View> {
     let position = crate::pages::position(&pagination, SORT);
     let zone = views::zone(cx);
 
-    let mut query = Deal::all().order_by(Deal::fields().id().desc());
-    if let Some(filter) = filter {
-        query = query.filter(filter);
-    }
-    let rows = query
+    let rows = Deal::all()
+        .filter(filter)
+        .order_by(Deal::fields().id().desc())
         .limit(pagination::fetch_limit(page_size))
         .offset(position.offset)
         .exec(&mut db)
@@ -166,9 +158,14 @@ async fn index(cx: &Cx) -> Result<impl View> {
     let companies: HashMap<i64, String> = if company_ids.is_empty() {
         HashMap::new()
     } else {
-        Company::filter(Company::fields().id().in_list(company_ids))
-            .exec(&mut db)
-            .await?
+        Company::filter(
+            Company::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Company::fields().id().in_list(company_ids)),
+        )
+        .exec(&mut db)
+        .await?
             .into_iter()
             .map(|company| (company.id, company.name))
             .collect()
@@ -176,9 +173,14 @@ async fn index(cx: &Cx) -> Result<impl View> {
     let contacts: HashMap<i64, String> = if contact_ids.is_empty() {
         HashMap::new()
     } else {
-        Contact::filter(Contact::fields().id().in_list(contact_ids))
-            .exec(&mut db)
-            .await?
+        Contact::filter(
+            Contact::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Contact::fields().id().in_list(contact_ids)),
+        )
+        .exec(&mut db)
+        .await?
             .into_iter()
             .map(|contact| {
                 (
@@ -297,9 +299,11 @@ async fn index(cx: &Cx) -> Result<impl View> {
 #[page("/deals/new")]
 async fn new_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     auth::require_user(cx)?;
-    let companies = company_options(&mut db).await?;
-    let contacts = contact_options(&mut db).await?;
+    let companies = company_options(&mut db, tenant).await?;
+    let contacts = contact_options(&mut db, tenant).await?;
 
     Ok(view! {
         <div class="page-head">
@@ -351,8 +355,25 @@ fn form_money(value: String) -> i64 {
     domain::opt(value).and_then(|v| domain::parse_money(&v)).unwrap_or(0)
 }
 
+/// Check that the company and contact a form named belong to this workspace.
+///
+/// A deal pointing at another workspace's company would be a link between two
+/// tenants, which is exactly what this refuses.
+async fn checked_links(
+    db: &mut toasty::Db,
+    tenant: Tenant,
+    company_id: Option<i64>,
+    contact_id: Option<i64>,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let company = access::require_reference::<Company>(db, tenant.account_id, company_id).await?;
+    let contact = access::require_reference::<Contact>(db, tenant.account_id, contact_id).await?;
+    Ok((company, contact))
+}
+
 #[route(POST "/deals")]
 async fn create(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOther> {
+    let tenant = Tenant::of(cx)?;
+
     let config = crate::config_of(cx);
     let crate::csrf::CsrfForm(input) = body;
     let zone = views::zone(cx);
@@ -361,12 +382,23 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOth
         return Err(bad_request("Deal title is required").into());
     }
 
+    // Both references must be in this workspace, checked before the row is
+    // written rather than left dangling.
+    let (company_id, contact_id) = checked_links(
+        &mut db(cx),
+        tenant,
+        domain::opt(input.company_id.clone()).and_then(|id| id.parse().ok()),
+        domain::opt(input.contact_id.clone()).and_then(|id| id.parse().ok()),
+    )
+    .await?;
+
     let deal = toasty::create!(Deal {
+        account_id: tenant.account_id,
         title,
         value_cents: form_money(input.value),
         stage: Stage::parse(input.stage.trim()).unwrap_or(Stage::Lead).as_str(),
-        company_id: form_id(input.company_id),
-        contact_id: form_id(input.contact_id),
+        company_id,
+        contact_id,
         // Parsed in the display zone, so the date shown back is the date typed.
         expected_close: domain::opt(input.expected_close)
             .and_then(|d| domain::parse_date_in(&d, &zone)),
@@ -391,25 +423,45 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOth
 #[page("/deals/{deal_id}")]
 async fn show(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let id = *path_param::<DealId>(cx)?;
-    let deal = find(&mut db, id).await?;
+    let deal = find(&mut db, tenant, id).await?;
     let zone = views::zone(cx);
 
     let company = match deal.company_id {
-        Some(company_id) => Company::filter(Company::fields().id().eq(company_id))
-            .first()
-            .exec(&mut db)
-            .await?,
+        Some(company_id) => Company::filter(
+            Company::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Company::fields().id().eq(company_id)),
+        )
+        .first()
+        .exec(&mut db)
+        .await?,
         None => None,
     };
     let contact = match deal.contact_id {
-        Some(contact_id) => Contact::filter(Contact::fields().id().eq(contact_id))
-            .first()
-            .exec(&mut db)
-            .await?,
+        Some(contact_id) => Contact::filter(
+            Contact::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Contact::fields().id().eq(contact_id)),
+        )
+        .first()
+        .exec(&mut db)
+        .await?,
         None => None,
     };
-    let panel = activity_panel(&mut db, Activity::fields().deal_id().eq(Some(id)), cx).await?;
+    let panel = activity_panel(
+        &mut db,
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().deal_id().eq(Some(id))),
+        cx,
+    )
+    .await?;
     let (activities, authors) = (panel.activities, panel.authors);
 
     let company_name = company
@@ -529,12 +581,14 @@ struct StageForm {
 #[route(POST "/deals/{deal_id}/stage")]
 async fn set_stage(cx: &Cx, body: crate::csrf::CsrfForm<StageForm>) -> Result<SeeOther> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(input) = body;
     auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
     let stage = Stage::parse(input.stage.trim()).ok_or_else(|| bad_request("Unknown stage"))?;
 
-    let mut deal = find(&mut db, id).await?;
+    let mut deal = find(&mut db, tenant, id).await?;
     toasty::update!(deal { stage: stage.as_str() })
         .exec(&mut db)
         .await?;
@@ -547,11 +601,13 @@ async fn set_stage(cx: &Cx, body: crate::csrf::CsrfForm<StageForm>) -> Result<Se
 #[page("/deals/{deal_id}/edit")]
 async fn edit_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
-    let deal = find(&mut db, id).await?;
-    let companies = company_options(&mut db).await?;
-    let contacts = contact_options(&mut db).await?;
+    let deal = find(&mut db, tenant, id).await?;
+    let companies = company_options(&mut db, tenant).await?;
+    let contacts = contact_options(&mut db, tenant).await?;
     let zone = views::zone(cx);
 
     Ok(view! {
@@ -580,6 +636,8 @@ async fn edit_form(cx: &Cx) -> Result<impl View> {
 #[route(POST "/deals/{deal_id}")]
 async fn update(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOther> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let crate::csrf::CsrfForm(input) = body;
     auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
@@ -590,13 +648,21 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOth
         return Err(bad_request("Deal title is required").into());
     }
 
-    let mut deal = find(&mut db, id).await?;
+    let (company_id, contact_id) = checked_links(
+        &mut db,
+        tenant,
+        form_id(input.company_id.clone()),
+        form_id(input.contact_id.clone()),
+    )
+    .await?;
+
+    let mut deal = find(&mut db, tenant, id).await?;
     toasty::update!(deal {
         title,
         value_cents: form_money(input.value),
         stage: Stage::parse(input.stage.trim()).unwrap_or(Stage::Lead).as_str(),
-        company_id: form_id(input.company_id),
-        contact_id: form_id(input.contact_id),
+        company_id,
+        contact_id,
         expected_close: domain::opt(input.expected_close)
             .and_then(|d| domain::parse_date_in(&d, &zone)),
         notes: domain::opt(input.notes),
@@ -612,12 +678,21 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOth
 #[route(POST "/deals/{deal_id}/delete")]
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
 
-    for mut activity in Activity::filter(Activity::fields().deal_id().eq(Some(id)))
-        .exec(&mut db)
-        .await?
+    find(&mut db, tenant, id).await?;
+
+    for mut activity in Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().deal_id().eq(Some(id))),
+    )
+    .exec(&mut db)
+    .await?
     {
         toasty::update!(activity { deal_id: Option::<i64>::None })
             .exec(&mut db)

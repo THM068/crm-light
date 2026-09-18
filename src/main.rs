@@ -54,6 +54,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         redact(&config.database_url),
         config.time_zone,
     );
+    // Sign-up is how a fresh installation is entered, so it is worth naming
+    // rather than leaving somebody staring at a login form with no account.
+    // Built from the same variables Topcoat itself reads, so the line points at
+    // where the server is actually listening.
+    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    println!("sign up at http://{host}:{port}/signup to create the first workspace");
 
     let db = Db::builder()
         .models(toasty::models!(crm_light::*))
@@ -65,17 +72,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("applied {} migration(s)", report.applied());
     }
 
-    // The bootstrap account first: without it a fresh database cannot be signed
-    // into at all, because every route requires a session.
-    if let Some(username) = seed::ensure_bootstrap_admin(&db).await? {
-        println!(
-            "created the bootstrap account {username:?} with no password — set one at \
-             /account as soon as you have signed in"
-        );
-    }
-
-    if config.seed_demo_data {
-        seed::seed_demo_data(&db, &config.time_zone).await?;
+    // There is no bootstrap account: a fresh installation is entered through
+    // `/signup`, which creates a workspace and makes its first member its
+    // administrator. The demo book therefore waits until somebody has signed
+    // up, because it needs a workspace to belong to.
+    if config.seed_demo_data && seed::seed_demo_data(&db, &config.time_zone).await? {
+        println!("seeded the demo book into the first workspace");
     }
 
     // A long-lived deployment accumulates a session per sign-in; sweeping at

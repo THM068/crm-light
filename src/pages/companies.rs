@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::access::{self, Tenant};
 use crate::auth;
 use crate::db;
 use crate::domain::{self, Stage};
@@ -25,7 +26,7 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        error::{RouterErrorExt, SeeOther, bad_request, see_other},
+        error::{SeeOther, bad_request, see_other},
         page, path_param, query_params, route,
     },
     view::{View, component, view},
@@ -52,14 +53,12 @@ struct Row {
     open_value_cents: i64,
 }
 
-/// Load a company or answer 404.
-async fn find(db: &mut toasty::Db, id: i64) -> Result<Company> {
-    Company::filter(Company::fields().id().eq(id))
-        .first()
-        .exec(db)
-        .await?
-        .ok_or_not_found()
-        .map_err(Into::into)
+/// Load a company for this workspace.
+///
+/// Returns 403 when the company exists in another workspace and 404 when it
+/// does not exist at all; see [`crate::access`] for why those are different.
+async fn find(db: &mut toasty::Db, tenant: Tenant, id: i64) -> Result<Company> {
+    access::require::<Company>(db, tenant.account_id, id).await
 }
 
 /// Contact counts and open pipeline for exactly the companies on screen.
@@ -68,15 +67,25 @@ async fn find(db: &mut toasty::Db, id: i64) -> Result<Company> {
 /// deals, both scoped with `IN (…)` to the page's ids.
 async fn rollups(
     db: &mut toasty::Db,
+    tenant: Tenant,
     ids: &[i64],
 ) -> Result<(HashMap<i64, usize>, HashMap<i64, i64>)> {
     if ids.is_empty() {
         return Ok((HashMap::new(), HashMap::new()));
     }
 
-    let contacts = Contact::filter(Contact::fields().company_id().in_list(ids.to_vec()))
-        .exec(db)
-        .await?;
+    // The tenant filter is redundant here — the ids came from a scoped query —
+    // and it is kept because a rollup is exactly the kind of aggregate that
+    // quietly counts another workspace's rows if the ids ever come from
+    // somewhere else.
+    let contacts = Contact::filter(
+        Contact::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Contact::fields().company_id().in_list(ids.to_vec())),
+    )
+    .exec(db)
+    .await?;
     let mut counts: HashMap<i64, usize> = HashMap::new();
     for contact in contacts {
         if let Some(company_id) = contact.company_id {
@@ -93,8 +102,9 @@ async fn rollups(
         .collect();
     let deals = Deal::filter(
         Deal::fields()
-            .company_id()
-            .in_list(ids.to_vec())
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Deal::fields().company_id().in_list(ids.to_vec()))
             .and(Deal::fields().stage().in_list(open_stages)),
     )
     .exec(db)
@@ -115,19 +125,25 @@ async fn rollups(
 #[page("/companies")]
 async fn index(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let params = query_params::<ListQuery>(cx)?;
     let search = params.q.clone().unwrap_or_default().trim().to_string();
     let page_size = crate::config_of(cx).page_size;
 
     // The filter is built once and used by both the count and the page query,
-    // so the two can never describe different result sets.
-    let filter = (!search.is_empty())
-        .then(|| Company::fields().name().contains_ignoring_case(&search));
+    // so the two can never describe different result sets. The tenant clause is
+    // part of it rather than added later, so it cannot be left off one of them.
+    let mut filter = Company::fields().account_id().eq(tenant.account_id);
+    if !search.is_empty() {
+        filter = filter.and(Company::fields().name().contains_ignoring_case(&search));
+    }
 
-    let total = match &filter {
-        Some(filter) => Company::all().filter(filter.clone()).count().exec(&mut db).await?,
-        None => Company::all().count().exec(&mut db).await?,
-    } as usize;
+    let total = Company::all()
+        .filter(filter.clone())
+        .count()
+        .exec(&mut db)
+        .await? as usize;
 
     let pagination = Pagination {
         next: params.next.clone(),
@@ -135,11 +151,9 @@ async fn index(cx: &Cx) -> Result<impl View> {
     };
     let position = crate::pages::position(&pagination, SORT);
 
-    let mut query = Company::all().order_by(Company::fields().name().asc());
-    if let Some(filter) = filter {
-        query = query.filter(filter);
-    }
-    let rows = query
+    let rows = Company::all()
+        .filter(filter)
+        .order_by(Company::fields().name().asc())
         .limit(pagination::fetch_limit(page_size))
         .offset(position.offset)
         .exec(&mut db)
@@ -150,7 +164,7 @@ async fn index(cx: &Cx) -> Result<impl View> {
     let shown_to = page.showing_to();
 
     let ids: Vec<i64> = page.rows.iter().map(|company| company.id).collect();
-    let (contact_counts, open_values) = rollups(&mut db, &ids).await?;
+    let (contact_counts, open_values) = rollups(&mut db, tenant, &ids).await?;
 
     let rows: Vec<Row> = page
         .rows
@@ -254,6 +268,8 @@ struct CompanyForm {
 
 #[route(POST "/companies")]
 async fn create(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<SeeOther> {
+    let tenant = Tenant::of(cx)?;
+
     let config = crate::config_of(cx);
     let crate::csrf::CsrfForm(input) = body;
     let name = input.name.trim();
@@ -262,6 +278,7 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<See
     }
 
     let company = toasty::create!(Company {
+        account_id: tenant.account_id,
         name,
         industry: domain::opt(input.industry),
         website: domain::opt(input.website),
@@ -287,21 +304,36 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<See
 #[page("/companies/{company_id}")]
 async fn show(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+
     let id = *path_param::<CompanyId>(cx)?;
-    let company = find(&mut db, id).await?;
+    let company = find(&mut db, tenant, id).await?;
     let zone = views::zone(cx);
 
-    let contacts = Contact::filter(Contact::fields().company_id().eq(id))
-        .order_by(Contact::fields().last_name().asc())
-        .exec(&mut db)
-        .await?;
-    let deals = Deal::filter(Deal::fields().company_id().eq(id))
-        .order_by(Deal::fields().created_at().desc())
-        .exec(&mut db)
-        .await?;
+    let contacts = Contact::filter(
+        Contact::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Contact::fields().company_id().eq(id)),
+    )
+    .order_by(Contact::fields().last_name().asc())
+    .exec(&mut db)
+    .await?;
+    let deals = Deal::filter(
+        Deal::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Deal::fields().company_id().eq(id)),
+    )
+    .order_by(Deal::fields().created_at().desc())
+    .exec(&mut db)
+    .await?;
     let panel = activity_panel(
         &mut db,
-        Activity::fields().company_id().eq(Some(id)),
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().company_id().eq(Some(id))),
         cx,
     )
     .await?;
@@ -420,8 +452,9 @@ async fn show(cx: &Cx) -> Result<impl View> {
 async fn edit_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
     auth::require_user(cx)?;
+    let tenant = Tenant::of(cx)?;
     let id = *path_param::<CompanyId>(cx)?;
-    let company = find(&mut db, id).await?;
+    let company = find(&mut db, tenant, id).await?;
 
     Ok(view! {
         <div class="page-head">
@@ -447,6 +480,7 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<See
     let mut db = db(cx);
     let crate::csrf::CsrfForm(input) = body;
     auth::require_user(cx)?;
+    let tenant = Tenant::of(cx)?;
     let id = *path_param::<CompanyId>(cx)?;
 
     let name = input.name.trim();
@@ -454,7 +488,7 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<See
         return Err(bad_request("Company name is required").into());
     }
 
-    let mut company = find(&mut db, id).await?;
+    let mut company = find(&mut db, tenant, id).await?;
     toasty::update!(company {
         name,
         industry: domain::opt(input.industry),
@@ -474,28 +508,48 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<CompanyForm>) -> Result<See
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     let mut db = db(cx);
     auth::require_user(cx)?;
+    let tenant = Tenant::of(cx)?;
     let id = *path_param::<CompanyId>(cx)?;
 
+    // Refuse before touching anything, so a cross-tenant delete cannot detach
+    // another workspace's children.
+    find(&mut db, tenant, id).await?;
+
     // Detach children instead of leaving dangling foreign keys behind.
-    for mut contact in Contact::filter(Contact::fields().company_id().eq(id))
-        .exec(&mut db)
-        .await?
+    for mut contact in Contact::filter(
+        Contact::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Contact::fields().company_id().eq(id)),
+    )
+    .exec(&mut db)
+    .await?
     {
         toasty::update!(contact { company_id: Option::<i64>::None })
             .exec(&mut db)
             .await?;
     }
-    for mut deal in Deal::filter(Deal::fields().company_id().eq(id))
-        .exec(&mut db)
-        .await?
+    for mut deal in Deal::filter(
+        Deal::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Deal::fields().company_id().eq(id)),
+    )
+    .exec(&mut db)
+    .await?
     {
         toasty::update!(deal { company_id: Option::<i64>::None })
             .exec(&mut db)
             .await?;
     }
-    for mut activity in Activity::filter(Activity::fields().company_id().eq(Some(id)))
-        .exec(&mut db)
-        .await?
+    for mut activity in Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().company_id().eq(Some(id))),
+    )
+    .exec(&mut db)
+    .await?
     {
         toasty::update!(activity { company_id: Option::<i64>::None })
             .exec(&mut db)

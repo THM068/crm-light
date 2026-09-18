@@ -10,6 +10,7 @@ pub mod contacts;
 pub mod dashboard;
 pub mod deals;
 pub mod login;
+pub mod signup;
 
 use std::collections::HashMap;
 
@@ -89,4 +90,16 @@ pub async fn activity_panel(
 /// defaulting differently on each page.
 pub fn creator(cx: &Cx) -> Option<i64> {
     auth::current_user(cx).map(|user| user.id)
+}
+
+/// Every URL that matches nothing else.
+///
+/// `not_found!("/")` registers a catch-all page that resolves to a
+/// [`topcoat::router::error::NotFoundError`]. Declaring it matters: without a
+/// catch-all, a request nothing matched is answered by the router *before* the
+/// layouts run, so it would miss the error boundary and the styled 404 page
+/// with it. With it, the error bubbles up through [`crate::root`] like any
+/// other and comes out looking like the rest of the site.
+pub mod not_found {
+    topcoat::router::not_found!("/");
 }

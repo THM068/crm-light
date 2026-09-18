@@ -1,21 +1,17 @@
-//! First-run data: the bootstrap administrator, and optionally a demo book.
+//! The demo book.
 //!
-//! Two separate concerns, deliberately:
+//! There is no bootstrap account any more. A fresh installation is entered
+//! through `/signup`, which creates a workspace and makes its first member an
+//! administrator — so the app never ships a shared credential, and never has a
+//! user without a workspace.
 //!
-//! - [`ensure_bootstrap_admin`] always runs. It creates the account you sign in
-//!   with on a fresh installation — `admin`, no password — and does nothing if
-//!   that account already exists. Without it a fresh database would be
-//!   unreachable, since every route requires a session.
-//! - [`seed_demo_data`] inserts the sample companies, contacts, deals, and
-//!   activities, and only does so when the database has no companies. Set
-//!   `CRM_SEED=0` to skip it.
+//! [`seed_demo_data`] gives the *first* workspace some records to look at: it
+//! inserts the sample companies, contacts, deals, and activities, but only when
+//! the database has no companies at all. Set `CRM_SEED=0` to skip it.
 
-use crate::domain::{self, ActivityKind, Role, Stage, TimeZone};
+use crate::domain::{self, ActivityKind, Stage, TimeZone};
 use crate::models::{Activity, Company, Contact, Deal, User};
 use toasty::Db;
-
-/// Username of the account created on a fresh installation.
-pub const BOOTSTRAP_USERNAME: &str = "admin";
 
 /// Shorthand for an optional text field.
 fn s(value: &str) -> Option<String> {
@@ -37,63 +33,45 @@ fn days_ahead(days: i64, zone: &TimeZone) -> i64 {
     zone.start_of_day(target).unwrap_or(target)
 }
 
-/// Create the bootstrap administrator if no account exists yet.
+/// The workspace and member demo data is attributed to, if there is one.
 ///
-/// Returns the username when it created one, so startup can say so loudly. The
-/// account has no password, which [`crate::config::Config::allow_passwordless_login`]
-/// then decides whether to honour; the guard against a wide-open door is the
-/// sign-in throttle, which locks the account after a handful of failures, plus
-/// a warning at startup.
-pub async fn ensure_bootstrap_admin(db: &Db) -> toasty::Result<Option<String>> {
-    let mut db = db.clone();
-
-    if User::all().count().exec(&mut db).await? > 0 {
-        return Ok(None);
-    }
-
-    toasty::create!(User {
-        username: BOOTSTRAP_USERNAME,
-        username_lower: domain::normalize_username(BOOTSTRAP_USERNAME),
-        display_name: s("Administrator"),
-        password_hash: None,
-        role: Role::Admin.as_str(),
-        totp_secret: None,
-        active: true,
-        created_at: domain::now(),
-        last_login_at: None,
-    })
-    .exec(&mut db)
-    .await?;
-
-    Ok(Some(BOOTSTRAP_USERNAME.to_string()))
-}
-
-/// The account demo data is attributed to, if there is one.
-async fn demo_author(db: &mut Db) -> Option<i64> {
-    User::all()
+/// The demo book needs a tenant, and it is only meaningful once somebody has
+/// signed up. With no account yet there is nothing to seed, so startup skips it
+/// and the first workspace starts empty.
+async fn demo_owner(db: &mut Db) -> Option<(i64, Option<i64>)> {
+    let user = User::all()
         .order_by(User::fields().id().asc())
         .first()
         .exec(db)
         .await
         .ok()
-        .flatten()
-        .map(|user| user.id)
+        .flatten()?;
+    Some((user.account_id, Some(user.id)))
 }
 
-/// Insert the demo book, unless the database already has companies.
-pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
+/// Insert the demo book into the first workspace, unless there is already data.
+///
+/// Returns whether anything was written, so startup can say which of the two
+/// reasons it skipped.
+pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<bool> {
     // `Db` is a cheap handle to the pool, so the clone is not a second pool.
     let mut db = db.clone();
 
     if Company::all().count().exec(&mut db).await? > 0 {
-        return Ok(());
+        return Ok(false);
     }
 
-    let author = demo_author(&mut db).await;
+    // No workspace means nobody has signed up yet: there is no tenant to put
+    // the demo rows in, and inventing one would create a workspace nobody can
+    // sign in to.
+    let Some((account_id, author)) = demo_owner(&mut db).await else {
+        return Ok(false);
+    };
 
     // --- Companies ---------------------------------------------------------
 
     let northwind = toasty::create!(Company {
+        account_id,
         name: "Northwind Trading",
         industry: s("Import / Export"),
         website: s("https://northwind.example.com"),
@@ -106,6 +84,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let acme = toasty::create!(Company {
+        account_id,
         name: "Acme Robotics",
         industry: s("Manufacturing"),
         website: s("https://acme-robotics.example.com"),
@@ -118,6 +97,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let blue_harbor = toasty::create!(Company {
+        account_id,
         name: "Blue Harbor Logistics",
         industry: s("Logistics"),
         website: s("https://blueharbor.example.com"),
@@ -130,6 +110,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let vertex = toasty::create!(Company {
+        account_id,
         name: "Vertex Analytics",
         industry: s("Software"),
         website: s("https://vertex.example.com"),
@@ -144,6 +125,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     // A company whose name carries the characters a `LIKE` search used to treat
     // as wildcards, so the escape path is exercised by ordinary use.
     let discount = toasty::create!(Company {
+        account_id,
         name: "50% Off Supplies",
         industry: s("Retail"),
         website: None,
@@ -158,6 +140,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     // --- Contacts ----------------------------------------------------------
 
     let turing = toasty::create!(Contact {
+        account_id,
         first_name: "Alan",
         last_name: "Turing",
         email: s("alan.turing@northwind.example.com"),
@@ -172,6 +155,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let hopper = toasty::create!(Contact {
+        account_id,
         first_name: "Grace",
         last_name: "Hopper",
         email: s("grace.hopper@acme-robotics.example.com"),
@@ -186,6 +170,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let pauling = toasty::create!(Contact {
+        account_id,
         first_name: "Linus",
         last_name: "Pauling",
         email: s("linus.pauling@acme-robotics.example.com"),
@@ -200,6 +185,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let johnson = toasty::create!(Contact {
+        account_id,
         first_name: "Katherine",
         last_name: "Johnson",
         email: s("katherine.johnson@blueharbor.example.com"),
@@ -214,6 +200,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let lovelace = toasty::create!(Contact {
+        account_id,
         first_name: "Ada",
         last_name: "Lovelace",
         email: s("ada.lovelace@vertex.example.com"),
@@ -229,6 +216,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
 
     // A contact that is not attached to a company yet.
     toasty::create!(Contact {
+        account_id,
         first_name: "Rosalind",
         last_name: "Franklin",
         email: s("rosalind@example.com"),
@@ -243,6 +231,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     toasty::create!(Contact {
+        account_id,
         first_name: "Barbara",
         last_name: "Liskov",
         email: s("barbara@offsupplies.example.com"),
@@ -259,6 +248,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     // --- Deals -------------------------------------------------------------
 
     let freight_portal = toasty::create!(Deal {
+        account_id,
         title: "Freight portal build-out",
         value_cents: 3_250_000,
         stage: Stage::Qualified.as_str(),
@@ -273,6 +263,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let line_retrofit = toasty::create!(Deal {
+        account_id,
         title: "Assembly line retrofit",
         value_cents: 12_500_000,
         stage: Stage::Proposal.as_str(),
@@ -287,6 +278,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     toasty::create!(Deal {
+        account_id,
         title: "Support renewal 2027",
         value_cents: 2_200_000,
         stage: Stage::Won.as_str(),
@@ -301,6 +293,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let tracking_addon = toasty::create!(Deal {
+        account_id,
         title: "Fleet tracking add-on",
         value_cents: 1_800_000,
         stage: Stage::Lead.as_str(),
@@ -315,6 +308,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     let platform_licence = toasty::create!(Deal {
+        account_id,
         title: "Analytics platform licence",
         value_cents: 4_800_000,
         stage: Stage::Negotiation.as_str(),
@@ -329,6 +323,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     toasty::create!(Deal {
+        account_id,
         title: "Pilot expansion",
         value_cents: 950_000,
         stage: Stage::Lost.as_str(),
@@ -343,6 +338,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
     .await?;
 
     toasty::create!(Deal {
+        account_id,
         title: "Bulk packaging order",
         value_cents: 480_000,
         stage: Stage::Lead.as_str(),
@@ -427,6 +423,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
 
     for (kind, body, company_id, contact_id, deal_id, age) in activities {
         toasty::create!(Activity {
+            account_id,
             kind: kind.as_str(),
             body,
             company_id,
@@ -439,24 +436,7 @@ pub async fn seed_demo_data(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
         .await?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
-/// The demo book, for callers that do not have a zone in hand.
-pub async fn seed_if_empty(db: &Db, zone: &TimeZone) -> toasty::Result<()> {
-    seed_demo_data(db, zone).await
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_bootstrap_username_is_normalised() {
-        assert_eq!(
-            domain::normalize_username(BOOTSTRAP_USERNAME),
-            BOOTSTRAP_USERNAME
-        );
-        assert!(domain::username_is_well_formed(BOOTSTRAP_USERNAME));
-    }
-}

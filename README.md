@@ -1,7 +1,7 @@
 # crm-light
 
-A small CRM: companies, contacts, deals, and logged activity, persisted in
-PostgreSQL, with accounts and sign-in.
+A small multi-tenant CRM: companies, contacts, deals, and logged activity,
+persisted in PostgreSQL, with workspaces, sign-up, and sign-in.
 
 - **Web**: [Topcoat](https://github.com/tokio-rs/topcoat) 0.8 — server-rendered
   HTML with typed routes and components.
@@ -20,17 +20,16 @@ createdb crm_light
 cargo run
 ```
 
-Then open <http://127.0.0.1:3000> and sign in as `admin` with the password field
-left blank.
+Then open <http://127.0.0.1:3000> and **create a workspace at `/signup`**. You
+become its administrator and are signed straight in.
 
-On first start the app applies its migrations and creates that one account. It
-has **no password**, and a blank password is accepted for it while
-`CRM_ALLOW_EMPTY_PASSWORD` is on — which is the default, so that a fresh
-installation is reachable at all. Set a password on it at `/account` before
-anything else can reach the port.
+There is no default account and no shared credential: sign-up is the only way
+into a fresh installation. The first workspace starts empty, and the demo book
+described below is seeded into it on the next start.
 
-With `CRM_SEED` unset it also inserts demo data, so the pages have something to
-show. Set `CRM_SEED=0` to skip that.
+With `CRM_SEED` unset the app inserts demo data into the first workspace, so the
+pages have something to show. It needs a workspace to put it in, so it waits
+until somebody has signed up. Set `CRM_SEED=0` to skip it entirely.
 
 ### Configuration
 
@@ -44,7 +43,7 @@ show. Set `CRM_SEED=0` to skip that.
 | `CRM_PAGE_SIZE`             | `25`                                   | Rows per list page (1–500).                                           |
 | `CRM_LOGIN_MAX_ATTEMPTS`    | `8`                                    | Failed sign-ins before an account is temporarily locked.              |
 | `CRM_LOGIN_LOCKOUT_MINUTES` | `15`                                   | How long that lock lasts.                                             |
-| `CRM_ALLOW_EMPTY_PASSWORD`  | `1`                                    | Whether an account with no stored password may sign in with a blank one. |
+| `CRM_ALLOW_EMPTY_PASSWORD`  | `1`                                    | Whether an account with no stored password may sign in with a blank one. Nothing creates such an account, so this only matters for rows left by an older version. |
 | `CRM_SEED`                  | unset (on)                             | Set to `0` to skip the demo data.                                     |
 | `HOST`                      | `127.0.0.1`                            | Listen address (read by Topcoat).                                     |
 | `PORT`                      | `3000`                                 | Listen port (read by Topcoat).                                        |
@@ -64,19 +63,32 @@ than being silently ignored.
 ### Tests
 
 ```bash
-cargo test     # domain, auth, CSRF, pagination, and search unit tests
+cargo test     # domain, access, auth, CSRF, pagination, and search unit tests
 cargo clippy --all-targets
 ```
 
 The tests are unit tests: they need no database server and run in about a
-second. Anything that needs to issue a real query is exercised by hand against
+second. The ones worth knowing about pin the rules that are easy to break by
+accident:
+
+- `access::tests::every_tenant_owned_model_is_loadable` — fails if a tenant-owned
+  model is added without going through the isolation check.
+- `access::tests::attaching_a_reason_does_not_hide_the_status` — a 403 must stay
+  a 403 once an explanation is attached, not become a 500.
+- `auth::tests::assets_stay_anonymous_but_are_not_redirected_away` — the
+  distinction that keeps the stylesheet loading after sign-in.
+- `domain::tests::local_midnight_round_trips_through_a_dst_transition` — the
+  date a user typed is the date they get back.
+
+Anything that needs to issue a real query is exercised by hand against
 PostgreSQL; see "What is not covered" below.
 
 ## What it does
 
 | Page                  | What's there                                                        |
 | --------------------- | ------------------------------------------------------------------- |
-| `/login`              | Sign-in, with an optional two-factor code                            |
+| `/signup`             | Create a workspace; you become its administrator                     |
+| `/login`              | Sign-in: workspace, username, password, optional two-factor code      |
 | `/`                   | Counts, pipeline value, pipeline by stage, paginated activity feed    |
 | `/companies`          | Searchable, paginated list with contact counts and open pipeline      |
 | `/companies/{id}`     | Details, contacts, deals, activity log                               |
@@ -91,27 +103,75 @@ Every record can be created, edited, and deleted. Activity is logged from the
 page of whatever it belongs to, and posting returns you there. Every list page
 is paginated and every filter runs in the database.
 
-## Accounts and access
+## Workspaces, and what one can see
 
-**Every route requires a session.** The only exceptions are `/login` and the
-stylesheet; there is no anonymous read path.
+A **workspace** is one organisation's set of records. Everything a member can see
+belongs to exactly one workspace, and nobody can see into another.
 
-Sign-in is by username and password. Usernames are matched case-insensitively —
-`Admin` and `admin` are one account — and passwords are stored as Argon2id PHC
-strings with a per-password salt, so two accounts with the same password do not
-share a hash.
+```
+Account ──< User ──< Session            the tenant, its people, their sessions
+   └──< Company ──< Contact
+              └──< Deal
+                     └──< Activity      every CRM row carries account_id
+```
+
+Signing up creates a workspace and makes its first member an administrator. That
+administrator adds the rest at `/admin/users`, and everybody in the workspace
+shares its data — there is no per-record ownership *inside* a workspace.
+
+### Isolation, and the two answers it gives
+
+Every read of tenant-owned data goes through `src/access.rs`, which does two
+things:
+
+1. **Filters on `account_id`.** The filter is built in one place rather than
+   retyped at each call site, because the failure mode of forgetting it is
+   showing somebody another organisation's pipeline.
+2. **Decides between 403 and 404.** A record that exists in *another* workspace
+   answers **403**, with a page that names what was refused: "That company (id 1)
+   belongs to a different workspace, so it is not yours to see or change." An id
+   that is not there at all answers **404**.
+
+The 403 is a deliberate choice. It tells a signed-in member that they have
+reached the edge of their workspace rather than that they mistyped — the more
+useful answer inside a CRM — at the cost of confirming that *some* row with that
+id exists somewhere. If this ever held data whose mere existence is sensitive,
+both branches should collapse into a 404; `Denied::into_error` in `src/access.rs`
+is the one place to change it.
+
+This applies to writes as much as reads. Naming a record from another workspace
+in a form — a deal's company, a contact's company, an activity's subject — is
+refused before the row is written, so a submission cannot forge a link between
+two workspaces.
+
+### Signing in
+
+Usernames are unique **per workspace**, not globally: two organisations may each
+have their own `admin` without colliding. That is why the sign-in form asks for
+the workspace's slug as well as the username, and why `/signup` derives the slug
+from the workspace name and shows you what it produced. The slug is prefilled
+from your last sign-in on the same browser, so in practice it is typed once per
+device.
+
+Usernames are matched case-insensitively inside their workspace, and passwords
+are stored as Argon2id PHC strings with a per-password salt, so two accounts with
+the same password do not share a hash.
+
+**Sign-up is public.** Anyone who can reach the port can create a workspace; that
+is the point of a self-service installation, and it is also the thing to turn off
+first if this is exposed to a network you do not control.
 
 ### Roles
 
-| Role            | May do                                                     |
+| Role            | May do within their workspace                               |
 | --------------- | ---------------------------------------------------------- |
 | **Member**      | Read and write every CRM record                             |
 | **Administrator** | The same, plus `/admin/users`                              |
 
-The role gates the administration surface only. There is no per-record
-ownership or visibility, which is what "no authorisation model" meant before:
-anyone signed in can see and change everything, and the role decides only who
-may manage accounts.
+A role is a per-workspace thing: an administrator manages the accounts in their
+own workspace and has no standing in any other. The role gates the administration
+surface only — inside a workspace everybody sees everything, which is what "no
+authorisation model" meant before.
 
 ### Two-factor authentication
 
@@ -122,7 +182,10 @@ check codes; anything with a database dump can generate valid codes, so the
 database has to be protected rather than the column encrypted with a key that
 sits next to it.
 
-### Rules that keep an installation administrable
+### Rules that keep a workspace administrable
+
+All of these are scoped to one workspace, so an administrator in another cannot
+keep one in place — or be kept in place by one.
 
 - The last active administrator cannot be demoted, closed, or deleted.
 - Nobody can demote, close, or delete their own account, so one careless click
@@ -132,8 +195,8 @@ sits next to it.
   account with no history.
 - Changing a password signs that account out everywhere except the session doing
   the change.
-- Repeated failed sign-ins against one username lock it for a while. This is
-  what makes the password-less bootstrap account survivable.
+- Repeated failed sign-ins against one username lock it for a while, per
+  workspace.
 
 ## Security
 
@@ -160,10 +223,16 @@ another site.
 **Response headers.** `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 and `Referrer-Policy: same-origin` are set on every authenticated response.
 
-**Sign-in throttling.** Failed attempts are counted per username; the counter
-clears on success and the account locks past the threshold. A failed attempt
-against a username that does not exist still costs a password verification, so
-response time does not reveal which usernames are real.
+**Tenant isolation.** Every read of tenant-owned data goes through
+`src/access.rs`; see "Workspaces" above. The filter is built in one place, and a
+record belonging to another workspace is refused before it is returned or
+written, including when a form names it as a company/contact/deal reference.
+
+**Sign-in throttling.** Failed attempts are counted per workspace and username;
+the counter clears on success and the account locks past the threshold. A failed
+attempt against a username that does not exist — or a workspace that does not
+exist — still costs a password verification, so neither response time nor the
+message reveals which are real.
 
 Setting `CRM_COOKIE_SECURE=1` and serving over TLS is still required for a real
 deployment: without it the session cookie travels in clear text.
@@ -178,15 +247,17 @@ src/
   config.rs           environment parsing and validation
   models.rs           the Toasty models
   domain.rs           Stage/ActivityKind/Role, money, dates, time zones, LIKE escaping
+  access.rs           tenancy: the tenant filter, 403-vs-404, slug and username rules
   auth.rs             password hashing, sessions, TOTP, throttling, the guard layer
   csrf.rs             token issuing and the validating form extractor
   flash.rs            one-shot notices carried across a redirect
   pagination.rs       opaque cursors, page assembly
   search.rs           case-insensitive, escape-aware text search
-  seed.rs             the bootstrap account and the demo data
-  views.rs            shared components: badges, activity feed, pager, banners
+  seed.rs             the demo data
+  views.rs            shared components: badges, activity feed, pager, error pages
   pages/
-    mod.rs            shared page helpers
+    mod.rs            shared page helpers, the catch-all 404
+    signup.rs         /signup
     login.rs          /login, /logout, /account*
     admin.rs          /admin/users*
     dashboard.rs      /
@@ -207,36 +278,52 @@ floating point, and no database date type whose time zone handling would have to
 be reasoned about separately.
 
 ```
-users ──< sessions
-  │
-  └──< activities.user_id, companies.created_by, …   (who did it)
-companies ──┬─< contacts ──┐
-            ├─< deals ─────┤
-            └─< activities ┘        activities.company_id / contact_id / deal_id
-                                    are all optional, so a note can hang off
-                                    a company, a contact, a deal, or nothing
+accounts ──┬─< users ──< sessions
+           │     └──< activities.user_id, companies.created_by, …   (who did it)
+           ├─< login_attempts
+           └─< companies ──┬─< contacts ──┐
+                           ├─< deals ─────┤
+                           └─< activities ┘
 ```
+
+`activities.company_id` / `contact_id` / `deal_id` are all optional, so a note
+can hang off a company, a contact, a deal, or nothing.
 
 | Table            | Columns                                                                              |
 | ---------------- | ------------------------------------------------------------------------------------ |
-| `companies`      | `id`, `name`, `industry`, `website`, `phone`, `notes`, `created_at`, `created_by`      |
-| `contacts`       | `id`, `first_name`, `last_name`, `email`, `phone`, `title`, `company_id`, `notes`, `created_at`, `created_by` |
-| `deals`          | `id`, `title`, `value_cents`, `stage`, `company_id`, `contact_id`, `expected_close`, `notes`, `created_at`, `created_by` |
-| `activities`     | `id`, `kind`, `body`, `company_id`, `contact_id`, `deal_id`, `created_at`, `user_id`   |
-| `users`          | `id`, `username`, `username_lower`, `display_name`, `password_hash`, `role`, `totp_secret`, `active`, `created_at`, `last_login_at` |
-| `sessions`       | `id`, `token_hash`, `user_id`, `created_at`, `expires_at`, `revoked_at`, `user_agent`, `ip` |
-| `login_attempts` | `id`, `username_lower`, `failures`, `locked_until`, `last_failure_at`                  |
+| `accounts`       | `id`, `name`, `slug`, `created_at`, `created_by`                                        |
+| `users`          | `id`, **`account_id`**, `username`, `username_lower`, `display_name`, `password_hash`, `role`, `totp_secret`, `active`, `created_at`, `last_login_at` |
+| `sessions`       | `id`, `token_hash`, **`account_id`**, `user_id`, `created_at`, `expires_at`, `revoked_at`, `user_agent`, `ip` |
+| `login_attempts` | `id`, **`account_id`**, `username_lower`, `failures`, `locked_until`, `last_failure_at`  |
+| `companies`      | `id`, **`account_id`**, `name`, `industry`, `website`, `phone`, `notes`, `created_at`, `created_by` |
+| `contacts`       | `id`, **`account_id`**, `first_name`, `last_name`, `email`, `phone`, `title`, `company_id`, `notes`, `created_at`, `created_by` |
+| `deals`          | `id`, **`account_id`**, `title`, `value_cents`, `stage`, `company_id`, `contact_id`, `expected_close`, `notes`, `created_at`, `created_by` |
+| `activities`     | `id`, **`account_id`**, `kind`, `body`, `company_id`, `contact_id`, `deal_id`, `created_at`, `user_id`   |
 
-`username_lower` is a separate, uniquely indexed column rather than a functional
-index, so case-insensitive matching works the same way on any backend and the
-uniqueness constraint applies to the normalised form: `Ada` and `ada` cannot both
-exist.
+**`account_id` is on every tenant-owned table**, and the tenant column is
+deliberately *not* a `belongs_to` relation: a relation that eager-loads would
+hide exactly the column that must never be forgotten.
+
+`sessions.account_id` duplicates `users.account_id` on purpose. Resolving a
+request is then one query rather than two, and a session can never be read as
+belonging to a different workspace than its user — `resolve_session` refuses a
+mismatch, which is redundant with how sessions are written and is kept because
+it is the one place a mismatch would silently widen a tenant's reach.
+
+`accounts.slug` is the sign-in name and is uniquely indexed, because sign-in has
+to resolve a workspace from it.
+
+`username_lower` is a separate, indexed column rather than a functional index, so
+case-insensitive matching works the same way on any backend. It is **not**
+globally unique: uniqueness is per workspace, and Toasty has no composite unique
+index for root models, so `access::username_taken` enforces it and the index
+keeps that check cheap.
 
 Primary keys are `i64`, which is `BIGINT` in PostgreSQL and `INTEGER` in SQLite;
 `#[auto]` becomes `GENERATED BY DEFAULT AS IDENTITY`.
 
-Relationships are plain indexed foreign-key columns rather than
-`#[belongs_to]`/`#[has_many]` relations, so each page issues explicit queries
+Relationships between the CRM tables are plain indexed foreign-key columns
+rather than `#[belongs_to]`/`#[has_many]`, so each page issues explicit queries
 you can read top to bottom. Deleting a company, contact, or deal **detaches**
 its children — it does not cascade — so a contact survives its company being
 deleted, with `company_id` set back to `NULL`.
@@ -284,10 +371,11 @@ migrations are recorded in the database's `__toasty_migrations` table, so
 reads the same `CRM_DB` the server does.
 
 `0001_extra_indexes.sql` is hand-written, because Toasty's `#[index]` creates a
-single-column index per field and its root models have no composite index. Every
-list page sorts by `(sort column, id)`, and the composite index is what lets the
-database walk that order instead of sorting a prefix of the table. `deals` and
-`activities` need nothing extra: their sort column *is* the primary key.
+single-column index per field and its root models have no composite index. It
+carries two kinds of index: the `(sort column, id)` order every list page walks,
+and tenant-first indexes for the `account_id` filter that leads almost every
+query. Without the second, the planner has to choose between the tenant index
+and the foreign-key index and filter afterwards.
 
 ## Notes and remaining limitations
 
@@ -295,8 +383,21 @@ The list of things a production CRM would still want:
 
 - **No password reset by email.** An administrator sets passwords; there is no
   self-service reset and no mail.
-- **No per-record ownership.** Anyone signed in reads and writes everything. The
-  role decides only who manages accounts.
+- **The 403 leaks that a record exists somewhere.** It says "different
+  workspace" rather than pretending the id is unknown. That is the requested
+  behaviour and the more useful answer inside a CRM, but it is a deliberate
+  trade; see "Isolation" above for how to collapse it into a 404.
+- **No per-record ownership inside a workspace.** Everyone in a workspace reads
+  and writes everything in it. The role decides only who manages accounts.
+- **Sign-up is open, and anyone can create a workspace.** There is no
+  invitation, no email check, and no CAPTCHA. Self-service is the point, but on
+  a public network it is the first thing to gate.
+- **A workspace cannot be renamed or deleted from the UI**, and there is no
+  "leave workspace" path for a member. The slug is a sign-in credential, so
+  changing it is a bigger operation than it looks.
+- **No cross-workspace administration.** There is no superuser: nobody can see
+  which workspaces exist, or help one that has lost its last administrator,
+  short of editing the database.
 - **Pagination is offset-based**, inside an opaque cursor. That removed the part
   that grew without bound — a page of 25 rows used to read every contact and
   every deal in the database to compute its rollups, and now reads only the rows
