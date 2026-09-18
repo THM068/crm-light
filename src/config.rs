@@ -70,6 +70,26 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Replace the password in a connection URL with `***`, for a message that may
+/// be read over somebody's shoulder or pasted into a chat.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.split_once('@') {
+        Some((userinfo, host)) => match userinfo.split_once(':') {
+            // A password is present: keep the user, hide the secret. Printing
+            // `***` for a URL that has no password at all would be worse than
+            // useless in a diagnostic about a *missing* password, because it
+            // would suggest one is there.
+            Some((user, _password)) => format!("{scheme}://{user}:***@{host}"),
+            None => format!("{scheme}://{userinfo}@{host}"),
+        },
+        None => url.to_string(),
+    }
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -185,10 +205,10 @@ impl Config {
         let allow_passwordless_login = env_bool("CRM_ALLOW_EMPTY_PASSWORD", true)?;
         if allow_passwordless_login {
             warnings.push(
-                "CRM_ALLOW_EMPTY_PASSWORD is on: an account with no stored password (the \
-                 bootstrap admin, until you set one) can be signed into with a blank password. \
-                 Set a password on every account, or set CRM_ALLOW_EMPTY_PASSWORD=0, before \
-                 exposing this app."
+                "CRM_ALLOW_EMPTY_PASSWORD is on: an account with no stored password can be \
+                 signed into with a blank password. Nothing creates such an account any more \
+                 — sign-up always sets one, and so does an administrator — so this only \
+                 affects rows carried over from an older version. On a server, set it to 0."
                     .to_string(),
             );
         }
@@ -219,6 +239,79 @@ impl Config {
         };
 
         Ok((config, ConfigWarnings(warnings)))
+    }
+
+    /// Whether the connection URL carries a password, and why not if it does
+    /// not.
+    ///
+    /// The Postgres driver reports a URL without a password as
+    /// "invalid configuration: password missing", which says nothing about
+    /// where the password should have come from. Checking here turns that into
+    /// a message that names the variable and shows the URL's shape.
+    ///
+    /// The compiled-in default has no password on purpose: it is a
+    /// development default that works over a unix socket with peer
+    /// authentication, and it is exactly the value the app falls back to when
+    /// `CRM_DB` is not in the environment — which is the usual reason a
+    /// deployment sees this at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming what is missing and how to supply it.
+    pub fn check_database_url(&self) -> Result<(), ConfigError> {
+        let url = &self.database_url;
+
+        // Passwords and user names are percent-encoded in the userinfo section;
+        // an `@` inside a password would therefore be escaped, so the first `@`
+        // is the separator.
+        let Some((_scheme, rest)) = url.split_once("://") else {
+            return Ok(()); // Not a URL shape this check understands; `supports` will reject it.
+        };
+        let Some((userinfo, _host)) = rest.split_once('@') else {
+            return Err(ConfigError(self.missing_password_message(
+                "there is no user name or password in it",
+            )));
+        };
+        let Some((user, password)) = userinfo.split_once(':') else {
+            return Err(ConfigError(self.missing_password_message(
+                "it has a user name but no password",
+            )));
+        };
+        if password.is_empty() {
+            return Err(ConfigError(
+                self.missing_password_message("the password is empty"),
+            ));
+        }
+        if user.is_empty() {
+            return Err(ConfigError(
+                self.missing_password_message("the user name is empty"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The explanation for a URL that cannot authenticate.
+    fn missing_password_message(&self, problem: &str) -> String {
+        let from_default = self.database_url == Self::DEFAULT_DATABASE_URL;
+        let mut message = format!(
+            "CRM_DB is not usable: {problem}.\n  \n  \
+             CRM_DB is currently: {}\n  \n  \
+             A working value puts the user name and password before the host, \
+             like this:\n    \
+             postgresql://USER:PASSWORD@127.0.0.1:5432/crm_light?sslmode=disable",
+            redact_url(&self.database_url)
+        );
+        if from_default {
+            message.push_str(
+                "\n  \n  That is the compiled-in default, which means CRM_DB is not set \
+                 in this environment. deploy/configure.sh writes it to \
+                 /etc/crm-light/app.env, which the systemd unit reads; running the \
+                 binary by hand does not pick that file up. Either start it through \
+                 systemd:\n    sudo systemctl start crm-light\n  or load the file \
+                 yourself:\n    set -a; . /etc/crm-light/app.env; set +a; cargo run",
+            );
+        }
+        message
     }
 
     /// Whether the connection URL selects a backend this app can actually run
@@ -281,6 +374,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_hides_the_password_and_admits_when_there_is_none() {
+        assert_eq!(
+            redact_url("postgresql://crm_light:hunter2@127.0.0.1:5432/db?sslmode=disable"),
+            "postgresql://crm_light:***@127.0.0.1:5432/db?sslmode=disable"
+        );
+        // No password: say so by showing none, rather than inventing a `***`
+        // that would imply a credential is present.
+        assert_eq!(
+            redact_url("postgresql://crm_light@127.0.0.1:5432/db"),
+            "postgresql://crm_light@127.0.0.1:5432/db"
+        );
+        assert_eq!(
+            redact_url("postgresql://crm_light:@127.0.0.1:5432/db"),
+            "postgresql://crm_light:***@127.0.0.1:5432/db"
+        );
+        // Nothing recognisable: returned unchanged rather than mangled.
+        assert_eq!(redact_url("sqlite:crm.db"), "sqlite:crm.db");
+        assert_eq!(redact_url("postgresql://localhost/db"), "postgresql://localhost/db");
+    }
+
+    #[test]
+    fn an_unusable_connection_url_is_explained_before_it_is_used() {
+        let mut config = Config::for_tests("postgresql://crm_light@127.0.0.1:5432/db");
+        let problem = config.check_database_url().expect_err("no password");
+        assert!(problem.to_string().contains("no password"), "{problem}");
+
+        config.database_url = "postgresql://crm_light:@127.0.0.1:5432/db".to_string();
+        assert!(config.check_database_url().is_err(), "an empty password cannot authenticate");
+
+        config.database_url = "postgresql://:pw@127.0.0.1:5432/db".to_string();
+        assert!(config.check_database_url().is_err(), "an empty user cannot authenticate");
+
+        config.database_url = "postgresql://crm_light:pw@127.0.0.1:5432/db".to_string();
+        assert!(config.check_database_url().is_ok());
+    }
+
+    #[test]
+    fn the_default_url_is_reported_as_unset_rather_than_wrong() {
+        // The usual cause of this failure is not a typo but a missing
+        // environment, so the message has to say so.
+        let config = Config::for_tests(Config::DEFAULT_DATABASE_URL);
+        let problem = config.check_database_url().expect_err("the default has no password");
+        let problem = problem.to_string();
+        assert!(problem.contains("not set in this environment"), "{problem}");
+        assert!(problem.contains("app.env"), "{problem}");
+        assert!(problem.contains("systemctl start crm-light"), "{problem}");
+    }
 
     #[test]
     fn driver_name_follows_the_url_scheme() {

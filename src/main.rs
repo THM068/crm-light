@@ -30,12 +30,13 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (config, warnings) = Config::from_env()?;
-    println!("{:#?}", config);
     let config = Arc::new(config);
 
     // The dashboard's aggregates are PostgreSQL SQL and the search asks for
     // `ILIKE`, so a SQLite URL would boot and then fail on the first page that
     // used either. One clear message at startup beats a 500 per request.
+    config.check_database_url()?;
+
     if !config.supports() {
         return Err(format!(
             "CRM_DB is {:?}, which this app cannot run on: its aggregates and search use \
