@@ -86,8 +86,19 @@ done
 
 die() { echo "configure: $*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "run this with sudo (it creates a system user and a unit)"
-command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script installs a systemd unit"
+# CRM_CONFIGURE_TESTING skips everything that needs root and systemd — creating
+# the user, installing the unit, reloading the daemon — while still doing the
+# validation and the env file. It exists so this script can be exercised without
+# a server; it is not a deployment mode, and it says so when used.
+TESTING="no"
+if [ -n "${CRM_CONFIGURE_TESTING:-}" ]; then
+    TESTING="yes"
+    echo "note: CRM_CONFIGURE_TESTING is set — validating and writing files only;" >&2
+    echo "      no user, unit, or daemon-reload. Not a deployment." >&2
+else
+    [ "$(id -u)" -eq 0 ] || die "run this with sudo (it creates a system user and a unit)"
+    command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script installs a systemd unit"
+fi
 [ -f "$DB_ENV_FILE" ] || die "$DB_ENV_FILE not found. Run deploy/provision-db.sh first."
 
 # Read CRM_DB out of the file provision-db.sh wrote, rather than asking for it
@@ -95,8 +106,35 @@ command -v systemctl >/dev/null 2>&1 || die "systemd not found; this script inst
 DB_URL="$(grep -E '^CRM_DB=' "$DB_ENV_FILE" | head -1 | cut -d= -f2-)"
 [ -n "$DB_URL" ] || die "no CRM_DB= line in $DB_ENV_FILE"
 
+# Check the URL before copying it into the app's environment. Without this, a
+# db.env that is missing its password — hand-edited, or written by an earlier
+# version of provision-db.sh — is copied straight through, and the app fails at
+# startup with "password missing", which points at the app rather than at the
+# file that is actually wrong.
+case "$DB_URL" in
+    *"://"*"@"*) ;;
+    *) die "$DB_ENV_FILE has a CRM_DB that is not a usable connection URL.
+It should look like:
+  postgresql://USER:PASSWORD@127.0.0.1:5432/DBNAME?sslmode=disable
+Found:
+  ${DB_URL}" ;;
+esac
+URL_USERINFO="${DB_URL#*://}"
+URL_USERINFO="${URL_USERINFO%%@*}"
+URL_PASSWORD="${URL_USERINFO#*:}"
+if [ "$URL_PASSWORD" = "$URL_USERINFO" ] || [ -z "$URL_PASSWORD" ]; then
+    die "$DB_ENV_FILE has a CRM_DB with no password in it:
+  ${DB_URL}
+Re-run the database step, which regenerates it:
+  sudo ./deploy/provision-db.sh"
+fi
+# Printed redacted, so the operator can see the shape without the secret.
+DB_URL_REDACTED="$(printf '%s' "$DB_URL" | sed 's#://[^@]*@#://***@#')"
+
 ENV_DIR="$(dirname "$ENV_FILE")"
-install -d -m 0750 "$ENV_DIR"
+# `install -d` cannot set a mode on a path it does not own on some filesystems;
+# the mkdir fallback keeps the script going where the mode is already fine.
+install -d -m 0750 "$ENV_DIR" 2>/dev/null || mkdir -p "$ENV_DIR"
 SERVICE_DIR="/etc/systemd/system"
 
 # --- The service user -----------------------------------------------------
@@ -104,14 +142,20 @@ SERVICE_DIR="/etc/systemd/system"
 # A system account with no shell and no home. The app needs no privileges: it
 # listens on a high port and writes to the database, and nothing else. Running
 # it as your login user would mean a bug in it is a bug with your ssh keys.
-if id "$APP_USER" >/dev/null 2>&1; then
+if [ "$TESTING" = "yes" ]; then
+    echo "user '$APP_USER': skipped (testing)"
+elif id "$APP_USER" >/dev/null 2>&1; then
     echo "user '$APP_USER': already exists"
 else
     useradd --system --no-create-home --shell /usr/sbin/nologin "$APP_USER"
     echo "user '$APP_USER': created (system account, no shell)"
 fi
 
-install -d -m 0755 -o "$APP_USER" -g "$APP_USER" "$APP_DIR"
+if [ "$TESTING" = "yes" ]; then
+    mkdir -p "$APP_DIR"
+else
+    install -d -m 0755 -o "$APP_USER" -g "$APP_USER" "$APP_DIR"
+fi
 
 # --- Cookie key -----------------------------------------------------------
 #
@@ -129,6 +173,15 @@ if [ "$USE_TLS" = "yes" ]; then
     COOKIE_SECURE="1"
 else
     COOKIE_SECURE="0"
+fi
+
+# The env file speaks 1/0 throughout, which is what the app parses. A generated
+# file that mixes `yes` and `1` invites somebody to copy the wrong style into an
+# edit, so pick one and use it for every flag.
+if [ "$ALLOW_SIGNUP" = "yes" ]; then
+    ALLOW_SIGNUP_FLAG="1"
+else
+    ALLOW_SIGNUP_FLAG="0"
 fi
 
 # --- Environment file -----------------------------------------------------
@@ -155,7 +208,7 @@ CRM_SESSION_TTL_HOURS=336
 # --- Who can get in -------------------------------------------------------
 # Turn off once your workspaces exist: with this on, anyone who can reach the
 # port can create a tenant of their own.
-CRM_ALLOW_SIGNUP=${ALLOW_SIGNUP}
+CRM_ALLOW_SIGNUP=${ALLOW_SIGNUP_FLAG}
 # No account is created without a password, so this only affects rows left by an
 # older version. Off is the safe setting.
 CRM_ALLOW_EMPTY_PASSWORD=0
@@ -181,8 +234,20 @@ PORT=${PORT}
 EOF
 )
 chmod 0640 "$ENV_FILE"
-chown "root:${APP_USER}" "$ENV_FILE"
-echo "env file: $ENV_FILE (0640, root:$APP_USER)"
+if [ "$TESTING" = "yes" ]; then
+    echo "env file: $ENV_FILE (0640, owned by $(id -un))"
+else
+    chown "root:${APP_USER}" "$ENV_FILE"
+    echo "env file: $ENV_FILE (0640, root:$APP_USER)"
+fi
+echo "  CRM_DB: ${DB_URL_REDACTED}"
+
+if [ "$TESTING" = "yes" ]; then
+    echo "unit: skipped (testing)"
+    echo
+    echo "Done (testing). Wrote $ENV_FILE; no unit installed."
+    exit 0
+fi
 
 # --- systemd unit ---------------------------------------------------------
 #

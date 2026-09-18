@@ -290,6 +290,39 @@ signs cookies weakly, and says so.
 stock Ubuntu install it listens on `127.0.0.1:5432`; if it is on a unix socket
 only, check `listen_addresses` in `postgresql.conf`.
 
+**`invalid configuration: password missing`.** The password is not in
+`CRM_DB`. There is no separate password variable to set — it lives inside the
+connection URL:
+
+```
+postgresql:// USER : PASSWORD @HOST:PORT/DBNAME?sslmode=disable
+              ^^^^   ^^^^^^^^
+```
+
+Find out which file is wrong:
+
+```bash
+sudo grep -c '@' /etc/crm-light/db.env /etc/crm-light/app.env      # a URL with a password has an '@'
+sudo sed 's#://[^@]*@#://***@#' /etc/crm-light/db.env              # shows the shape, hides the secret
+sudo systemctl show crm-light -p EnvironmentFiles                   # which files the unit actually reads
+```
+
+A `CRM_DB` like `postgresql://crm_light@127.0.0.1:5432/crm_light` — user, then
+`@`, with nothing between — is the usual shape of this mistake, and it comes from
+editing `db.env` by hand or from a run of an earlier `provision-db.sh`.
+
+Fix it by regenerating rather than editing, which also rotates the password:
+
+```bash
+sudo ./deploy/provision-db.sh          # rewrites db.env with a fresh password
+sudo ./deploy/configure.sh --domain your.domain   # re-reads it into app.env
+sudo systemctl restart crm-light
+```
+
+Both scripts now refuse to proceed on a URL without a password in it, so this
+fails where the mistake is made rather than at startup with a message that
+points at the app.
+
 **`password authentication failed`.** Two causes, and they need opposite fixes.
 
 The password in `db.env` and the one on the role have diverged — usually because

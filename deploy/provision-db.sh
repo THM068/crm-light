@@ -207,6 +207,32 @@ as_postgres -q -d "$DB_NAME" -c "ALTER SCHEMA public OWNER TO \"$DB_ROLE\";"
 
 DB_URL="postgresql://${DB_ROLE}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=disable"
 
+# The URL is assembled from shell variables, so check it rather than trusting
+# it. An empty password here produces a connection string the driver rejects at
+# *startup* — long after this script said it was done — with a message about a
+# missing password that says nothing about where the password should have come
+# from. Failing here instead keeps the cause and the symptom in one place.
+#
+#   postgresql:// user : password @ host : port / db ? params
+#                ^^^^   ^^^^^^^^
+for part in "://" "@"; do
+    case "$DB_URL" in
+        *"$part"*) ;;
+        *) die "assembled an unusable connection string (no '${part}'): check --db/--role/--host/--port" ;;
+    esac
+done
+URL_USERINFO="${DB_URL#*://}"
+URL_USERINFO="${URL_USERINFO%%@*}"
+# `${x#*:}` strips the shortest prefix up to the first colon and leaves the
+# rest. When there is no colon at all, it expands to `$x` unchanged, so that
+# case has to be checked separately — testing only for non-emptiness would also
+# reject a valid password that happens to be empty, which cannot happen here but
+# would be the wrong reason to fail.
+URL_PASSWORD="${URL_USERINFO#*:}"
+[ "$URL_PASSWORD" != "$URL_USERINFO" ] || die "assembled a connection string with no password in it"
+[ -n "$URL_PASSWORD" ] || die "assembled a connection string with an empty password"
+[ -n "${URL_USERINFO%%:*}" ] || die "assembled a connection string with an empty user name"
+
 # --- Write it out ---------------------------------------------------------
 #
 # The connection string carries the password. It goes in a 0600 file, owned by
