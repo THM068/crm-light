@@ -4,21 +4,23 @@
 //! contact, and deal pages, and posting returns to whichever record it was
 //! logged against.
 
-use crate::db;
-use crate::domain::{self, ActivityKind, opt};
-use crate::models::Activity;
 use serde::Deserialize;
 use topcoat::{
     Result,
     context::Cx,
     router::{
-        content::Form,
         error::{SeeOther, bad_request, see_other},
         path_param, route,
     },
 };
 
-path_param!(activity_id: u64, error = bad_request("Activity id must be a number"));
+use crate::auth;
+use crate::db;
+use crate::domain::{self, ActivityKind};
+use crate::models::Activity;
+use crate::pages::creator;
+
+path_param!(activity_id: i64, error = bad_request("Activity id must be a number"));
 
 #[derive(Deserialize)]
 struct ActivityForm {
@@ -35,12 +37,15 @@ struct ActivityForm {
 }
 
 /// Parse a hidden id field: empty means "not associated".
-fn form_id(value: String) -> Option<u64> {
-    opt(value).and_then(|id| id.parse().ok())
+fn form_id(value: String) -> Option<i64> {
+    domain::opt(value).and_then(|id| id.parse().ok())
 }
 
 #[route(POST "/activities")]
-async fn create(cx: &Cx, Form(input): Form<ActivityForm>) -> Result<SeeOther> {
+async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ActivityForm>) -> Result<SeeOther> {
+    auth::require_user(cx)?;
+    let crate::csrf::CsrfForm(input) = body;
+
     let body = input.body.trim();
     if body.is_empty() {
         return Err(bad_request("Activity note is required").into());
@@ -57,6 +62,8 @@ async fn create(cx: &Cx, Form(input): Form<ActivityForm>) -> Result<SeeOther> {
         contact_id,
         deal_id,
         created_at: domain::now(),
+        // The audit trail: who logged this, not only when.
+        user_id: creator(cx),
     })
     .exec(&mut db(cx))
     .await?;
@@ -77,6 +84,7 @@ async fn create(cx: &Cx, Form(input): Form<ActivityForm>) -> Result<SeeOther> {
 
 #[route(POST "/activities/{activity_id}/delete")]
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
+    auth::require_user(cx)?;
     let mut db = db(cx);
     let id = *path_param::<ActivityId>(cx)?;
 

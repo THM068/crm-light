@@ -1,36 +1,48 @@
 //! Contact pages: list, create, detail, edit, delete.
 
-use crate::db;
-use crate::domain::{self, opt};
-use crate::models::{Activity, Company, Contact, Deal};
-use crate::pages::{activity_feed, activity_form, stage_badge};
+use std::collections::HashMap;
+
 use serde::Deserialize;
+
+use crate::auth;
+use crate::db;
+use crate::domain;
+use crate::flash;
+use crate::models::{Activity, Company, Contact, Deal};
+use crate::pages::{Pagination, activity_panel, creator};
+use crate::pagination::{self, Sort};
+use crate::search::CaseInsensitiveLike;
+use crate::views::{self, activity_feed, activity_form, csrf_field, pager, query_string, stage_badge};
 use topcoat::{
     Result,
     context::Cx,
     router::{
-        content::Form,
         error::{RouterErrorExt, SeeOther, bad_request, see_other},
         page, path_param, query_params, route,
     },
     view::{View, component, view},
 };
 
-path_param!(contact_id: u64, error = bad_request("Contact id must be a number"));
+path_param!(contact_id: i64, error = bad_request("Contact id must be a number"));
+
+/// The column the list is ordered by.
+const SORT: Sort = Sort::asc("last_name");
 
 #[query_params(error = bad_request)]
-struct Search {
+struct ListQuery {
     q: Option<String>,
+    next: Option<String>,
+    prev: Option<String>,
 }
 
 #[query_params(error = bad_request)]
 struct NewContact {
-    company_id: Option<u64>,
+    company_id: Option<i64>,
 }
 
 /// One row of the contact list.
 struct Row {
-    id: u64,
+    id: i64,
     name: String,
     title: String,
     email: String,
@@ -39,7 +51,7 @@ struct Row {
 }
 
 /// Load a contact or answer 404.
-async fn find(db: &mut toasty::Db, id: u64) -> Result<Contact> {
+async fn find(db: &mut toasty::Db, id: i64) -> Result<Contact> {
     Contact::filter(Contact::fields().id().eq(id))
         .first()
         .exec(db)
@@ -49,11 +61,25 @@ async fn find(db: &mut toasty::Db, id: u64) -> Result<Contact> {
 }
 
 /// `(id, name)` for every company, for the company picker.
-async fn company_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
+async fn company_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
     Ok(Company::all()
         .order_by(Company::fields().name().asc())
         .exec(db)
         .await?
+        .into_iter()
+        .map(|company| (company.id, company.name))
+        .collect())
+}
+
+/// Resolve the company names for exactly the contacts on screen.
+async fn company_names(db: &mut toasty::Db, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let companies = Company::filter(Company::fields().id().in_list(ids.to_vec()))
+        .exec(db)
+        .await?;
+    Ok(companies
         .into_iter()
         .map(|company| (company.id, company.name))
         .collect())
@@ -64,50 +90,76 @@ async fn company_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
 #[page("/contacts")]
 async fn index(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    let params = query_params::<ListQuery>(cx)?;
+    let search = params.q.clone().unwrap_or_default().trim().to_string();
+    let page_size = crate::config_of(cx).page_size;
 
-    let search = query_params::<Search>(cx)?
-        .q
-        .clone()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    // One filter value, used by both the count and the page query.
+    let filter = (!search.is_empty()).then(|| {
+        Contact::fields()
+            .first_name()
+            .contains_ignoring_case(&search)
+            .or(Contact::fields().last_name().contains_ignoring_case(&search))
+            .or(Contact::fields().email().contains_ignoring_case(&search))
+            .or(Contact::fields().title().contains_ignoring_case(&search))
+    });
 
-    let contacts = if search.is_empty() {
-        Contact::all()
-            .order_by(Contact::fields().last_name().asc())
-            .exec(&mut db)
-            .await?
-    } else {
-        let pattern = format!("%{search}%");
-        Contact::filter(
-            Contact::fields()
-                .first_name()
-                .like(pattern.clone())
-                .or(Contact::fields().last_name().like(pattern.clone()))
-                .or(Contact::fields().email().like(pattern.clone()))
-                .or(Contact::fields().title().like(pattern)),
-        )
-        .order_by(Contact::fields().last_name().asc())
-        .exec(&mut db)
-        .await?
+    let total = match &filter {
+        Some(filter) => {
+            Contact::all()
+                .filter(filter.clone())
+                .count()
+                .exec(&mut db)
+                .await?
+        }
+        None => Contact::all().count().exec(&mut db).await?,
+    } as usize;
+
+    let pagination = Pagination {
+        next: params.next.clone(),
+        prev: params.prev.clone(),
     };
+    let position = crate::pages::position(&pagination, SORT);
 
-    let companies = Company::all().exec(&mut db).await?;
-    let rows: Vec<Row> = contacts
+    let mut query = Contact::all().order_by(Contact::fields().last_name().asc());
+    if let Some(filter) = filter {
+        query = query.filter(filter);
+    }
+    let rows = query
+        .limit(pagination::fetch_limit(page_size))
+        .offset(position.offset)
+        .exec(&mut db)
+        .await?;
+
+    let page = pagination::assemble(rows, page_size, position.offset, total, SORT);
+    let shown_from = page.showing_from();
+    let shown_to = page.showing_to();
+
+    // Only the companies this page actually references.
+    let company_ids: Vec<i64> = page
+        .rows
+        .iter()
+        .filter_map(|contact| contact.company_id)
+        .collect();
+    let names = company_names(&mut db, &company_ids).await?;
+
+    let rows: Vec<Row> = page
+        .rows
         .into_iter()
         .map(|contact| Row {
+            company: contact
+                .company_id
+                .and_then(|id| names.get(&id).cloned())
+                .unwrap_or_default(),
             id: contact.id,
             name: domain::full_name(&contact.first_name, &contact.last_name),
             title: contact.title.unwrap_or_default(),
             email: contact.email.unwrap_or_default(),
             phone: contact.phone.unwrap_or_default(),
-            company: contact
-                .company_id
-                .and_then(|id| companies.iter().find(|c| c.id == id))
-                .map(|c| c.name.clone())
-                .unwrap_or_default(),
         })
         .collect();
+
+    let query = query_string(&[("q", Some(search.clone()))]);
 
     Ok(view! {
         <div class="page-head">
@@ -146,6 +198,16 @@ async fn index(cx: &Cx) -> Result<impl View> {
                 </tbody>
             </table>
         }
+
+        pager(
+            base: "/contacts",
+            query: &query,
+            total: page.total,
+            shown_from: shown_from,
+            shown_to: shown_to,
+            prev: page.prev.clone(),
+            next: page.next.clone(),
+        )
     })
 }
 
@@ -154,6 +216,7 @@ async fn index(cx: &Cx) -> Result<impl View> {
 #[page("/contacts/new")]
 async fn new_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let preselected = query_params::<NewContact>(cx)?.company_id;
     let options = company_options(&mut db).await?;
 
@@ -181,6 +244,7 @@ async fn new_form(cx: &Cx) -> Result<impl View> {
 
 #[derive(Deserialize)]
 struct ContactForm {
+    #[serde(default)]
     first_name: String,
     #[serde(default)]
     last_name: String,
@@ -198,7 +262,9 @@ struct ContactForm {
 }
 
 #[route(POST "/contacts")]
-async fn create(cx: &Cx, Form(input): Form<ContactForm>) -> Result<SeeOther> {
+async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ContactForm>) -> Result<SeeOther> {
+    let config = crate::config_of(cx);
+    let crate::csrf::CsrfForm(input) = body;
     let first_name = input.first_name.trim();
     let last_name = input.last_name.trim();
     if first_name.is_empty() && last_name.is_empty() {
@@ -208,16 +274,26 @@ async fn create(cx: &Cx, Form(input): Form<ContactForm>) -> Result<SeeOther> {
     let contact = toasty::create!(Contact {
         first_name,
         last_name,
-        email: opt(input.email),
-        phone: opt(input.phone),
-        title: opt(input.title),
-        company_id: opt(input.company_id).and_then(|id| id.parse().ok()),
-        notes: opt(input.notes),
+        email: domain::opt(input.email),
+        phone: domain::opt(input.phone),
+        title: domain::opt(input.title),
+        company_id: domain::opt(input.company_id).and_then(|id| id.parse().ok()),
+        notes: domain::opt(input.notes),
         created_at: domain::now(),
+        created_by: creator(cx),
     })
     .exec(&mut db(cx))
     .await?;
 
+    flash::set(
+        cx,
+        config,
+        flash::Kind::Ok,
+        &format!(
+            "Added {}.",
+            domain::full_name(&contact.first_name, &contact.last_name)
+        ),
+    );
     Ok(see_other(format!("/contacts/{}", contact.id)))
 }
 
@@ -228,6 +304,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
     let id = *path_param::<ContactId>(cx)?;
     let contact = find(&mut db, id).await?;
+    let zone = views::zone(cx);
 
     let company = match contact.company_id {
         Some(company_id) => Company::filter(Company::fields().id().eq(company_id))
@@ -245,14 +322,17 @@ async fn show(cx: &Cx) -> Result<impl View> {
         .company_id
         .map(|id| format!("/companies/{id}"))
         .unwrap_or_default();
-    let deals = Deal::filter(Deal::fields().contact_id().eq(Some(id)))
+    let deals = Deal::filter(Deal::fields().contact_id().eq(id))
         .order_by(Deal::fields().created_at().desc())
         .exec(&mut db)
         .await?;
-    let activities = Activity::filter(Activity::fields().contact_id().eq(Some(id)))
-        .order_by(Activity::fields().created_at().desc())
-        .exec(&mut db)
-        .await?;
+    let panel = activity_panel(
+        &mut db,
+        Activity::fields().contact_id().eq(Some(id)),
+        cx,
+    )
+    .await?;
+    let (activities, authors) = (panel.activities, panel.authors);
 
     Ok(view! {
         <div class="page-head">
@@ -260,6 +340,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
             <div class="actions">
                 <a class="btn" href=(format!("/contacts/{id}/edit"))>"Edit"</a>
                 <form class="inline" method="post" action=(format!("/contacts/{id}/delete"))>
+                    csrf_field()
                     <button class="btn btn-danger" type="submit">"Delete"</button>
                 </form>
             </div>
@@ -286,7 +367,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
                         <dt>"Notes"</dt>
                         <dd>(contact.notes.as_deref().unwrap_or("—"))</dd>
                         <dt>"Added"</dt>
-                        <dd>(domain::format_date(contact.created_at))</dd>
+                        <dd>(zone.format_date(contact.created_at))</dd>
                     </dl>
                 </div>
 
@@ -324,7 +405,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
 
                 <h2>"History"</h2>
                 <div class="panel">
-                    activity_feed(activities: activities)
+                    activity_feed(activities: activities, authors: authors, zone: zone)
                 </div>
             </div>
         </div>
@@ -336,6 +417,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
 #[page("/contacts/{contact_id}/edit")]
 async fn edit_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let id = *path_param::<ContactId>(cx)?;
     let contact = find(&mut db, id).await?;
     let options = company_options(&mut db).await?;
@@ -363,8 +445,10 @@ async fn edit_form(cx: &Cx) -> Result<impl View> {
 }
 
 #[route(POST "/contacts/{contact_id}")]
-async fn update(cx: &Cx, Form(input): Form<ContactForm>) -> Result<SeeOther> {
+async fn update(cx: &Cx, body: crate::csrf::CsrfForm<ContactForm>) -> Result<SeeOther> {
     let mut db = db(cx);
+    let crate::csrf::CsrfForm(input) = body;
+    auth::require_user(cx)?;
     let id = *path_param::<ContactId>(cx)?;
 
     let first_name = input.first_name.trim();
@@ -377,11 +461,11 @@ async fn update(cx: &Cx, Form(input): Form<ContactForm>) -> Result<SeeOther> {
     toasty::update!(contact {
         first_name,
         last_name,
-        email: opt(input.email),
-        phone: opt(input.phone),
-        title: opt(input.title),
-        company_id: opt(input.company_id).and_then(|id| id.parse().ok()),
-        notes: opt(input.notes),
+        email: domain::opt(input.email),
+        phone: domain::opt(input.phone),
+        title: domain::opt(input.title),
+        company_id: domain::opt(input.company_id).and_then(|id| id.parse().ok()),
+        notes: domain::opt(input.notes),
     })
     .exec(&mut db)
     .await?;
@@ -394,13 +478,14 @@ async fn update(cx: &Cx, Form(input): Form<ContactForm>) -> Result<SeeOther> {
 #[route(POST "/contacts/{contact_id}/delete")]
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let id = *path_param::<ContactId>(cx)?;
 
-    for mut deal in Deal::filter(Deal::fields().contact_id().eq(Some(id)))
+    for mut deal in Deal::filter(Deal::fields().contact_id().eq(id))
         .exec(&mut db)
         .await?
     {
-        toasty::update!(deal { contact_id: Option::<u64>::None })
+        toasty::update!(deal { contact_id: Option::<i64>::None })
             .exec(&mut db)
             .await?;
     }
@@ -408,7 +493,7 @@ async fn destroy(cx: &Cx) -> Result<SeeOther> {
         .exec(&mut db)
         .await?
     {
-        toasty::update!(activity { contact_id: Option::<u64>::None })
+        toasty::update!(activity { contact_id: Option::<i64>::None })
             .exec(&mut db)
             .await?;
     }
@@ -421,7 +506,7 @@ async fn destroy(cx: &Cx) -> Result<SeeOther> {
 // --- Shared form -----------------------------------------------------------
 
 #[component]
-async fn company_select(companies: Vec<(u64, String)>, selected: Option<u64>) -> Result<impl View> {
+async fn company_select(companies: Vec<(i64, String)>, selected: Option<i64>) -> Result<impl View> {
     Ok(view! {
         <select id="company_id" name="company_id">
             <option value="">"— none —"</option>
@@ -442,12 +527,13 @@ async fn contact_form(
     phone: String,
     title: String,
     notes: String,
-    companies: Vec<(u64, String)>,
-    selected_company: Option<u64>,
+    companies: Vec<(i64, String)>,
+    selected_company: Option<i64>,
     submit_label: &str,
 ) -> Result<impl View> {
     Ok(view! {
         <form method="post" action=(action)>
+            csrf_field()
             <div class="form-row">
                 <div class="field">
                     <label for="first_name">"First name"</label>

@@ -1,88 +1,92 @@
-//! Page handlers and shared view components.
+//! Page handlers.
+//!
+//! One module per URL family, plus `login` for the authentication surface and
+//! `admin` for account management. Shared components live in [`crate::views`].
 
 pub mod activities;
+pub mod admin;
 pub mod companies;
 pub mod contacts;
 pub mod dashboard;
 pub mod deals;
+pub mod login;
 
-use crate::domain::{self, ActivityKind, Stage};
+use std::collections::HashMap;
+
+use toasty::stmt::Expr;
+use topcoat::context::Cx;
+
+use crate::auth;
+use crate::domain::TimeZone;
 use crate::models::Activity;
-use topcoat::{
-    Result,
-    view::{View, component, view},
-};
+use crate::pagination::{self, Position, Sort};
+use crate::views;
 
-/// Render an optional id for a hidden form input; absent becomes empty.
-fn id_value(id: Option<u64>) -> String {
-    id.map(|id| id.to_string()).unwrap_or_default()
-}
-
-/// Coloured badge showing a deal's stage.
-#[component]
-pub async fn stage_badge(stage: &str) -> Result<impl View> {
-    let stage = Stage::from_stored(stage);
-    Ok(view! {
-        <span class=(format!("badge {}", stage.css_class()))>(stage.label())</span>
-    })
-}
-
-/// A chronological list of logged activities, newest first.
-#[component]
-pub async fn activity_feed(activities: Vec<Activity>) -> Result<impl View> {
-    Ok(view! {
-        if activities.is_empty() {
-            <p class="empty">"Nothing logged yet."</p>
-        } else {
-            for activity in activities {
-                <div class="activity">
-                    <div class="head">
-                        <strong>(ActivityKind::from_stored(&activity.kind).label())</strong>
-                        <span class="actions">
-                            <span>(domain::format_datetime(activity.created_at))</span>
-                            <form class="inline" method="post" action=(format!("/activities/{}/delete", activity.id))>
-                                <button class="btn btn-sm btn-danger" type="submit">"Delete"</button>
-                            </form>
-                        </span>
-                    </div>
-                    <div class="body">(&activity.body)</div>
-                </div>
-            }
-        }
-    })
-}
-
-/// Inline form for logging an activity against a company, contact, or deal.
+/// Query parameters shared by every list page: the pager's cursors.
 ///
-/// All three ids are submitted; the ones that do not apply are sent empty and
-/// read back as `None`.
-#[component]
-pub async fn activity_form(
-    action: &str,
-    company_id: Option<u64>,
-    contact_id: Option<u64>,
-    deal_id: Option<u64>,
-) -> Result<impl View> {
-    Ok(view! {
-        <form method="post" action=(action)>
-            <input type="hidden" name="company_id" value=(id_value(company_id))>
-            <input type="hidden" name="contact_id" value=(id_value(contact_id))>
-            <input type="hidden" name="deal_id" value=(id_value(deal_id))>
-            <div class="form-row">
-                <div class="field">
-                    <label for="kind">"Type"</label>
-                    <select id="kind" name="kind">
-                        for kind in ActivityKind::ALL {
-                            <option value=(kind.as_str())>(kind.label())</option>
-                        }
-                    </select>
-                </div>
-            </div>
-            <div class="field">
-                <label for="body">"Note"</label>
-                <textarea id="body" name="body" required="" placeholder="What happened?"></textarea>
-            </div>
-            <button class="btn btn-primary" type="submit">"Log activity"</button>
-        </form>
+/// Each page flattens these fields into its own `#[query_params]` struct, so
+/// the whole query-string contract stays visible where the page is defined,
+/// while `position` below keeps the pager's rules in one place.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Pagination {
+    #[serde(default)]
+    pub next: Option<String>,
+    #[serde(default)]
+    pub prev: Option<String>,
+}
+
+impl Pagination {
+    /// The cursor parameters as [`crate::pagination`] understands them.
+    fn cursors(&self) -> pagination::CursorParams {
+        pagination::CursorParams {
+            next: self.next.clone(),
+            prev: self.prev.clone(),
+        }
+    }
+}
+
+/// Where a request sits in a list sorted by `sort`.
+///
+/// A cursor that does not match `sort` is ignored rather than rejected, so a
+/// bookmarked link from before an ordering change lands on the first page
+/// instead of on an error.
+pub fn position(cursors: &Pagination, sort: Sort) -> Position {
+    pagination::resolve(&cursors.cursors(), sort)
+}
+
+/// Everything a detail page's activity panel needs.
+pub struct ActivityPanel {
+    pub activities: Vec<Activity>,
+    pub authors: HashMap<i64, String>,
+    pub zone: TimeZone,
+}
+
+/// Load the activity feed for one association and resolve its author names.
+pub async fn activity_panel(
+    db: &mut toasty::Db,
+    filter: Expr<bool>,
+    cx: &Cx,
+) -> toasty::Result<ActivityPanel> {
+    let activities = Activity::filter(filter)
+        .order_by(Activity::fields().created_at().desc())
+        // Detail pages show the recent history rather than the whole log; the
+        // dashboard's feed is the paginated view of everything logged.
+        .limit(50)
+        .exec(db)
+        .await?;
+    let authors = views::author_names(db, &activities).await?;
+    Ok(ActivityPanel {
+        activities,
+        authors,
+        zone: views::zone(cx),
     })
+}
+
+/// Stamp a record with the user creating it.
+///
+/// Free-standing so every create handler records authorship the same way, and
+/// so the "no user in context" case is decided in one place rather than
+/// defaulting differently on each page.
+pub fn creator(cx: &Cx) -> Option<i64> {
+    auth::current_user(cx).map(|user| user.id)
 }

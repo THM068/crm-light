@@ -1,9 +1,18 @@
 //! Domain vocabulary and small formatting helpers.
 //!
-//! Money is stored as an integer number of cents and timestamps as Unix
-//! seconds, so no floating point and no timezone library are involved.
+//! Money is stored as an integer number of cents and every timestamp as Unix
+//! seconds, so the schema never depends on a database date type and there is no
+//! floating point anywhere in the money path.
+//!
+//! Timestamps are *stored* in UTC. Every value shown to a user is rendered
+//! through a [`TimeZone`], resolved once at startup from `CRM_TZ` (falling back
+//! to the host's zone), so the same row reads correctly wherever the app runs
+//! and a DST transition never shifts a displayed time by an hour.
 
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use jiff::{Timestamp, tz::TimeZone as JiffTimeZone};
 
 /// Current time as Unix seconds.
 pub fn now() -> i64 {
@@ -13,6 +22,9 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Seconds in a day.
+pub const DAY: i64 = 86_400;
+
 /// Trim a form value and treat the empty string as absent.
 pub fn opt(value: String) -> Option<String> {
     let trimmed = value.trim();
@@ -21,6 +33,110 @@ pub fn opt(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+// --- Time zone -------------------------------------------------------------
+
+/// The display time zone, wrapping the IANA database.
+///
+/// Cheap to clone: `jiff` shares the underlying zone data behind an `Arc`.
+#[derive(Debug, Clone)]
+pub struct TimeZone(JiffTimeZone);
+
+impl TimeZone {
+    /// UTC, used in tests and as the fallback when a zone cannot be resolved.
+    pub fn utc() -> Self {
+        Self(JiffTimeZone::UTC)
+    }
+
+    /// The host's zone, or UTC when it cannot be determined.
+    pub fn system() -> Self {
+        JiffTimeZone::try_system()
+            .map(Self)
+            .unwrap_or_else(|_| Self::utc())
+    }
+
+    /// Resolve an IANA name such as `Europe/London` or `America/New_York`.
+    ///
+    /// A leading `UTC`/`utc` is accepted explicitly, since `jiff`'s `get` wants
+    /// a real IANA name.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("z") {
+            return Some(Self::utc());
+        }
+
+        JiffTimeZone::get(name).ok().map(Self)
+    }
+
+    /// The zone's IANA name, e.g. `Some("Europe/London")`.
+    pub fn name(&self) -> Option<&str> {
+        self.0.iana_name()
+    }
+
+    /// The UTC offset in effect at `timestamp`, in seconds.
+    pub fn offset_seconds(&self, timestamp: i64) -> Option<i32> {
+        Timestamp::from_second(timestamp)
+            .ok()
+            .map(|ts| self.0.to_offset(ts).seconds())
+    }
+
+    /// `YYYY-MM-DD HH:MM` in this zone.
+    pub fn format_datetime(&self, timestamp: i64) -> String {
+        match Timestamp::from_second(timestamp) {
+            Ok(ts) => ts.to_zoned(self.0.clone()).strftime("%Y-%m-%d %H:%M").to_string(),
+            Err(_) => "—".to_string(),
+        }
+    }
+
+    /// `YYYY-MM-DD` in this zone.
+    pub fn format_date(&self, timestamp: i64) -> String {
+        match Timestamp::from_second(timestamp) {
+            Ok(ts) => ts.to_zoned(self.0.clone()).strftime("%Y-%m-%d").to_string(),
+            Err(_) => "—".to_string(),
+        }
+    }
+
+    /// Midnight at the start of the civil date containing `timestamp`.
+    ///
+    /// Dates are stored as the instant of local midnight so that a date shown
+    /// back through this zone is the date the user typed, even across a DST
+    /// boundary.
+    pub fn start_of_day(&self, timestamp: i64) -> Option<i64> {
+        let ts = Timestamp::from_second(timestamp).ok()?;
+        let date = ts.to_zoned(self.0.clone()).date();
+        date.at(0, 0, 0, 0)
+            .to_zoned(self.0.clone())
+            .ok()
+            .map(|zdt| zdt.timestamp().as_second())
+    }
+}
+
+impl fmt::Display for TimeZone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name().unwrap_or("UTC"))
+    }
+}
+
+/// `YYYY-MM-DD HH:MM` for a timestamp, in UTC.
+///
+/// Prefer [`TimeZone::format_datetime`]; this exists for tests and for the
+/// migration-time defaults where no zone is in hand.
+pub fn format_datetime(timestamp: i64) -> String {
+    TimeZone::utc().format_datetime(timestamp)
+}
+
+/// `YYYY-MM-DD` for a timestamp, in UTC.
+pub fn format_date(timestamp: i64) -> String {
+    TimeZone::utc().format_date(timestamp)
+}
+
+/// `YYYY-MM-DD` for a date input's `value` attribute, in UTC.
+pub fn date_input_value(timestamp: Option<i64>) -> String {
+    timestamp.map(format_date).unwrap_or_default()
 }
 
 // --- Deal stage ------------------------------------------------------------
@@ -45,7 +161,7 @@ impl Stage {
         Stage::Lost,
     ];
 
-    /// The value persisted in SQLite.
+    /// The value persisted in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             Stage::Lead => "lead",
@@ -94,6 +210,82 @@ impl Stage {
             Stage::Lost => "stage-lost",
         }
     }
+}
+
+// --- User role -------------------------------------------------------------
+
+/// What an account is allowed to do.
+///
+/// Every signed-in user may read and write the CRM records. The role gates the
+/// administration surface: managing accounts, and changing anyone's role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Full access, including `/admin/users`.
+    Admin,
+    /// Ordinary access to the CRM data, but not to account management.
+    Member,
+}
+
+impl Role {
+    pub const ALL: [Role; 2] = [Role::Member, Role::Admin];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Member => "member",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Admin => "Administrator",
+            Role::Member => "Member",
+        }
+    }
+
+    /// What the role may do, shown next to it in the user list.
+    pub fn description(self) -> &'static str {
+        match self {
+            Role::Admin => "Full access, including accounts",
+            Role::Member => "Read and write CRM records",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.as_str() == value)
+    }
+
+    /// Round-trip a stored string, defaulting to the least privileged role.
+    ///
+    /// An unrecognised value means the row was written by something that does
+    /// not know about the current role set, so it must not grant admin.
+    pub fn from_stored(value: &str) -> Role {
+        Role::parse(value).unwrap_or(Role::Member)
+    }
+
+    pub fn is_admin(self) -> bool {
+        matches!(self, Role::Admin)
+    }
+}
+
+/// Normalise a username for storage and lookup.
+///
+/// Live usernames keep their original case; this is what the unique index
+/// covers, so adding `Ada` when `ada` exists is a conflict rather than a second
+/// account that only fails at sign-in time.
+pub fn normalize_username(username: &str) -> String {
+    username.trim().to_ascii_lowercase()
+}
+
+/// Characters allowed in a username, besides being non-empty and at most 64
+/// characters.
+pub fn username_is_well_formed(username: &str) -> bool {
+    let trimmed = username.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'))
 }
 
 // --- Activity kind ---------------------------------------------------------
@@ -171,7 +363,12 @@ pub fn format_money(cents: i64) -> String {
 pub fn money_input_value(cents: i64) -> String {
     let negative = cents < 0;
     let abs = cents.unsigned_abs();
-    format!("{}{}.{:02}", if negative { "-" } else { "" }, abs / 100, abs % 100)
+    format!(
+        "{}{}.{:02}",
+        if negative { "-" } else { "" },
+        abs / 100,
+        abs % 100
+    )
 }
 
 /// Parse user input such as `1234.56`, `$1,234.56`, or `1234` into cents.
@@ -206,8 +403,14 @@ pub fn parse_money(input: &str) -> Option<i64> {
     // Round to the nearest cent rather than truncating.
     let mut cents = whole.checked_mul(100)?;
     let mut fraction_digits = fraction.chars();
-    let tens = fraction_digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0) as i64;
-    let ones = fraction_digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0) as i64;
+    let tens = fraction_digits
+        .next()
+        .and_then(|c| c.to_digit(10))
+        .unwrap_or(0) as i64;
+    let ones = fraction_digits
+        .next()
+        .and_then(|c| c.to_digit(10))
+        .unwrap_or(0) as i64;
     cents = cents.checked_add(tens * 10 + ones)?;
     if fraction_digits.next().is_some_and(|c| c >= '5') {
         cents = cents.checked_add(1)?;
@@ -218,7 +421,7 @@ pub fn parse_money(input: &str) -> Option<i64> {
 
 // --- Dates -----------------------------------------------------------------
 
-/// Convert a Unix timestamp to a `(year, month, day)` civil date.
+/// Convert a Unix timestamp to a `(year, month, day)` civil date, in UTC.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     // Howard Hinnant's `civil_from_days`, shifting the epoch to 0000-03-01.
     let z = days + 719_468;
@@ -244,24 +447,11 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
-/// Format a timestamp as `YYYY-MM-DD`.
-pub fn format_date(timestamp: i64) -> String {
-    let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Format a timestamp as `YYYY-MM-DD HH:MM` (UTC).
-pub fn format_datetime(timestamp: i64) -> String {
-    let days = timestamp.div_euclid(86_400);
-    let seconds = timestamp.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds / 3600;
-    let minute = (seconds % 3600) / 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
-}
-
-/// Parse a `YYYY-MM-DD` date into a Unix timestamp at midnight UTC.
-pub fn parse_date(input: &str) -> Option<i64> {
+/// Parse a `YYYY-MM-DD` date, rejecting impossible calendar dates.
+///
+/// Returns the civil date; the caller decides what instant to store it as, via
+/// [`TimeZone::start_of_day`] or [`parse_date`].
+pub fn parse_civil_date(input: &str) -> Option<(i64, u32, u32)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
@@ -271,16 +461,33 @@ pub fn parse_date(input: &str) -> Option<i64> {
     let year: i64 = parts.next()?.parse().ok()?;
     let month: u32 = parts.next()?.parse().ok()?;
     let day: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if parts.next().is_some() || !(1..=12).contains(&month) || day == 0 {
         return None;
     }
 
-    Some(days_from_civil(year, month, day) * 86_400)
+    // Round-trip the day through the civil conversion to reject 2026-02-30 and
+    // friends, which would otherwise roll over into March.
+    if civil_from_days(days_from_civil(year, month, day)) != (year, month, day) {
+        return None;
+    }
+
+    Some((year, month, day))
 }
 
-/// `YYYY-MM-DD` for a date input's `value` attribute.
-pub fn date_input_value(timestamp: Option<i64>) -> String {
-    timestamp.map(format_date).unwrap_or_default()
+/// Parse a `YYYY-MM-DD` date into a Unix timestamp at midnight UTC.
+pub fn parse_date(input: &str) -> Option<i64> {
+    let (year, month, day) = parse_civil_date(input)?;
+    Some(days_from_civil(year, month, day) * DAY)
+}
+
+/// Parse a `YYYY-MM-DD` date into the instant of midnight in `zone`.
+///
+/// This is what the deal form uses, so an "expected close" of 2026-09-18 is
+/// stored as the start of that day locally and displays back as 2026-09-18.
+pub fn parse_date_in(input: &str, zone: &TimeZone) -> Option<i64> {
+    let (year, month, day) = parse_civil_date(input)?;
+    let utc_midnight = days_from_civil(year, month, day) * DAY;
+    zone.start_of_day(utc_midnight).or(Some(utc_midnight))
 }
 
 /// "Ada Lovelace" from the two name parts.
@@ -292,6 +499,29 @@ pub fn full_name(first: &str, last: &str) -> String {
         (true, true) => "(unnamed)".to_string(),
     }
 }
+
+// --- Text search -----------------------------------------------------------
+
+/// Escape the `LIKE` metacharacters in a user-supplied search term.
+///
+/// Without this a search for `50%` matches every company, and `a_b` matches
+/// `axb`. The pattern is built for an `ESCAPE '\'` clause, so `\`, `%` and `_`
+/// are all escaped and the term only ever matches literally.
+pub fn like_contains(term: &str) -> String {
+    let mut pattern = String::with_capacity(term.len() + 2);
+    pattern.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// The `LIKE` escape character [`like_contains`] builds patterns for.
+pub const LIKE_ESCAPE: char = '\\';
 
 #[cfg(test)]
 mod tests {
@@ -322,16 +552,23 @@ mod tests {
         for timestamp in [0, 1_700_000_000, 2_000_000_000, 951_782_400] {
             let formatted = format_date(timestamp);
             let parsed = parse_date(&formatted).expect("formatted date parses");
-            assert_eq!(
-                format_date(parsed),
-                formatted,
-                "round trip for {timestamp}"
-            );
+            assert_eq!(format_date(parsed), formatted, "round trip for {timestamp}");
         }
         assert_eq!(format_date(0), "1970-01-01");
         assert_eq!(parse_date("1970-01-01"), Some(0));
         assert_eq!(parse_date("bogus"), None);
         assert_eq!(parse_date(""), None);
+    }
+
+    #[test]
+    fn dates_reject_impossible_calendar_days() {
+        assert_eq!(parse_date("2026-02-30"), None);
+        assert_eq!(parse_date("2026-13-01"), None);
+        assert_eq!(parse_date("2026-04-31"), None);
+        assert_eq!(parse_date("2026-00-10"), None);
+        // 2024 is a leap year, 2026 is not.
+        assert!(parse_date("2024-02-29").is_some());
+        assert_eq!(parse_date("2026-02-29"), None);
     }
 
     #[test]
@@ -342,5 +579,59 @@ mod tests {
         assert_eq!(Stage::from_stored("nonsense"), Stage::Lead);
         assert!(!Stage::Won.is_open());
         assert!(Stage::Lead.is_open());
+    }
+
+    #[test]
+    fn search_terms_are_escaped() {
+        assert_eq!(like_contains("acme"), "%acme%");
+        assert_eq!(like_contains("50%"), "%50\\%%");
+        assert_eq!(like_contains("a_b"), "%a\\_b%");
+        assert_eq!(like_contains("c:\\x"), "%c:\\\\x%");
+    }
+
+    #[test]
+    fn utc_zone_is_the_identity() {
+        let utc = TimeZone::utc();
+        assert_eq!(utc.format_datetime(0), "1970-01-01 00:00");
+        assert_eq!(utc.format_date(1_700_000_000), "2023-11-14");
+        assert_eq!(utc.offset_seconds(0), Some(0));
+    }
+
+    #[test]
+    fn zones_shift_the_rendered_hour() {
+        // 2023-11-14T22:13:20Z. London is on GMT in November, New York is
+        // five hours behind.
+        let london = TimeZone::parse("Europe/London").expect("known zone");
+        let new_york = TimeZone::parse("America/New_York").expect("known zone");
+        assert_eq!(london.format_datetime(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(new_york.format_datetime(1_700_000_000), "2023-11-14 17:13");
+
+        // Auckland's +13 in January pushes a late-UTC timestamp into the next
+        // civil day.
+        let auckland = TimeZone::parse("Pacific/Auckland").expect("known zone");
+        assert_eq!(auckland.format_date(1_700_000_000), "2023-11-15");
+    }
+
+    #[test]
+    fn zone_parsing_rejects_nonsense() {
+        assert!(TimeZone::parse("Mars/Olympus").is_none());
+        assert!(TimeZone::parse("").is_none());
+        assert!(TimeZone::parse("utc").is_some());
+    }
+
+    #[test]
+    fn local_midnight_round_trips_through_a_dst_transition() {
+        // British Summer Time ends on 2024-10-27; the day is 25 hours long.
+        let london = TimeZone::parse("Europe/London").expect("known zone");
+        let ts = parse_date_in("2024-10-27", &london).expect("valid date");
+        assert_eq!(london.format_date(ts), "2024-10-27");
+
+        // On that date midnight is still BST (+1), not GMT.
+        assert_eq!(london.offset_seconds(ts), Some(3600));
+
+        // And the spring transition, where midnight is GMT (+0).
+        let ts = parse_date_in("2024-03-31", &london).expect("valid date");
+        assert_eq!(london.format_date(ts), "2024-03-31");
+        assert_eq!(london.offset_seconds(ts), Some(0));
     }
 }

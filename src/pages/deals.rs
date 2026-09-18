@@ -1,32 +1,51 @@
 //! Deal pages: pipeline list, create, detail, stage moves, edit, delete.
+//!
+//! The list resolves the company and contact names for exactly the deals on
+//! screen, in one query each, rather than reading both whole tables and joining
+//! them in memory.
 
-use crate::db;
-use crate::domain::{self, Stage, opt, parse_date, parse_money};
-use crate::models::{Activity, Company, Contact, Deal};
-use crate::pages::{activity_feed, activity_form, stage_badge};
+use std::collections::HashMap;
+
 use serde::Deserialize;
+
+use crate::auth;
+use crate::db;
+use crate::domain::{self, Stage};
+use crate::flash;
+use crate::models::{Activity, Company, Contact, Deal};
+use crate::pages::{Pagination, activity_panel, creator};
+use crate::pagination::{self, Sort};
+use crate::search::CaseInsensitiveLike;
+use crate::views::{self, activity_feed, activity_form, csrf_field, pager, query_string, stage_badge};
 use topcoat::{
     Result,
     context::Cx,
     router::{
-        content::Form,
         error::{RouterErrorExt, SeeOther, bad_request, see_other},
         page, path_param, query_params, route,
     },
     view::{View, component, view},
 };
 
-path_param!(deal_id: u64, error = bad_request("Deal id must be a number"));
+path_param!(deal_id: i64, error = bad_request("Deal id must be a number"));
+
+/// Newest first. `created_at` is when the deal was entered, but the primary key
+/// is the sort column because it is unique: two deals entered in the same
+/// second would otherwise have no defined order between them, and a tie-break
+/// on an ambiguous key is what makes a row appear on two pages or none.
+const SORT: Sort = Sort::desc("id");
 
 #[query_params(error = bad_request)]
-struct Filters {
+struct ListQuery {
     q: Option<String>,
     stage: Option<String>,
+    next: Option<String>,
+    prev: Option<String>,
 }
 
 /// One row of the pipeline list.
 struct Row {
-    id: u64,
+    id: i64,
     title: String,
     stage: String,
     value_cents: i64,
@@ -36,7 +55,7 @@ struct Row {
 }
 
 /// Load a deal or answer 404.
-async fn find(db: &mut toasty::Db, id: u64) -> Result<Deal> {
+async fn find(db: &mut toasty::Db, id: i64) -> Result<Deal> {
     Deal::filter(Deal::fields().id().eq(id))
         .first()
         .exec(db)
@@ -46,7 +65,7 @@ async fn find(db: &mut toasty::Db, id: u64) -> Result<Deal> {
 }
 
 /// `(id, label)` pairs for the company picker.
-async fn company_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
+async fn company_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
     Ok(Company::all()
         .order_by(Company::fields().name().asc())
         .exec(db)
@@ -57,7 +76,7 @@ async fn company_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
 }
 
 /// `(id, label)` pairs for the contact picker.
-async fn contact_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
+async fn contact_options(db: &mut toasty::Db) -> Result<Vec<(i64, String)>> {
     Ok(Contact::all()
         .order_by(Contact::fields().last_name().asc())
         .exec(db)
@@ -77,9 +96,10 @@ async fn contact_options(db: &mut toasty::Db) -> Result<Vec<(u64, String)>> {
 #[page("/deals")]
 async fn index(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
-
-    let filters = query_params::<Filters>(cx)?;
+    let filters = query_params::<ListQuery>(cx)?;
     let search = filters.q.clone().unwrap_or_default().trim().to_string();
+    let page_size = crate::config_of(cx).page_size;
+
     let stage_filter = filters
         .stage
         .as_deref()
@@ -91,40 +111,106 @@ async fn index(cx: &Cx) -> Result<impl View> {
         .and_then(Stage::parse)
         .is_some();
 
-    let mut query = Deal::all().order_by(Deal::fields().created_at().desc());
-    if !search.is_empty() {
-        query = query.filter(Deal::fields().title().like(format!("%{search}%")));
-    }
+    // One filter value for both the count and the page query.
+    let mut filter = (!search.is_empty())
+        .then(|| Deal::fields().title().contains_ignoring_case(&search));
     if stage_active {
-        query = query.filter(Deal::fields().stage().eq(stage_filter.as_str()));
+        let stage = Deal::fields().stage().eq(stage_filter.as_str());
+        filter = Some(match filter {
+            Some(title) => title.and(stage),
+            None => stage,
+        });
     }
-    let deals = query.exec(&mut db).await?;
 
-    let companies = Company::all().exec(&mut db).await?;
-    let contacts = Contact::all().exec(&mut db).await?;
+    let total = match &filter {
+        Some(filter) => Deal::all()
+            .filter(filter.clone())
+            .count()
+            .exec(&mut db)
+            .await?,
+        None => Deal::all().count().exec(&mut db).await?,
+    } as usize;
 
-    let total: i64 = deals
+    let pagination = Pagination {
+        next: filters.next.clone(),
+        prev: filters.prev.clone(),
+    };
+    let position = crate::pages::position(&pagination, SORT);
+    let zone = views::zone(cx);
+
+    let mut query = Deal::all().order_by(Deal::fields().id().desc());
+    if let Some(filter) = filter {
+        query = query.filter(filter);
+    }
+    let rows = query
+        .limit(pagination::fetch_limit(page_size))
+        .offset(position.offset)
+        .exec(&mut db)
+        .await?;
+
+    let page = pagination::assemble(rows, page_size, position.offset, total, SORT);
+    let shown_from = page.showing_from();
+    let shown_to = page.showing_to();
+
+    let company_ids: Vec<i64> = page
+        .rows
+        .iter()
+        .filter_map(|deal| deal.company_id)
+        .collect();
+    let contact_ids: Vec<i64> = page
+        .rows
+        .iter()
+        .filter_map(|deal| deal.contact_id)
+        .collect();
+
+    let companies: HashMap<i64, String> = if company_ids.is_empty() {
+        HashMap::new()
+    } else {
+        Company::filter(Company::fields().id().in_list(company_ids))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|company| (company.id, company.name))
+            .collect()
+    };
+    let contacts: HashMap<i64, String> = if contact_ids.is_empty() {
+        HashMap::new()
+    } else {
+        Contact::filter(Contact::fields().id().in_list(contact_ids))
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|contact| {
+                (
+                    contact.id,
+                    domain::full_name(&contact.first_name, &contact.last_name),
+                )
+            })
+            .collect()
+    };
+
+    let total_open: i64 = page
+        .rows
         .iter()
         .filter(|deal| Stage::from_stored(&deal.stage).is_open())
         .map(|deal| deal.value_cents)
         .sum();
 
-    let rows: Vec<Row> = deals
+    let rows: Vec<Row> = page
+        .rows
         .into_iter()
         .map(|deal| Row {
             company: deal
                 .company_id
-                .and_then(|id| companies.iter().find(|c| c.id == id))
-                .map(|c| c.name.clone())
+                .and_then(|id| companies.get(&id).cloned())
                 .unwrap_or_default(),
             contact: deal
                 .contact_id
-                .and_then(|id| contacts.iter().find(|c| c.id == id))
-                .map(|c| domain::full_name(&c.first_name, &c.last_name))
+                .and_then(|id| contacts.get(&id).cloned())
                 .unwrap_or_default(),
             close: deal
                 .expected_close
-                .map(domain::format_date)
+                .map(|t| zone.format_date(t))
                 .unwrap_or_default(),
             id: deal.id,
             title: deal.title,
@@ -132,6 +218,15 @@ async fn index(cx: &Cx) -> Result<impl View> {
             value_cents: deal.value_cents,
         })
         .collect();
+
+    let stage_param = filters
+        .stage
+        .clone()
+        .filter(|_| stage_active);
+    let query = query_string(&[
+        ("q", Some(search.clone())),
+        ("stage", stage_param),
+    ]);
 
     Ok(view! {
         <div class="page-head">
@@ -180,10 +275,20 @@ async fn index(cx: &Cx) -> Result<impl View> {
                 </tbody>
             </table>
             <p class="muted">
-                "Open pipeline shown: "
-                (domain::format_money(total))
+                "Open pipeline on this page: "
+                (domain::format_money(total_open))
             </p>
         }
+
+        pager(
+            base: "/deals",
+            query: &query,
+            total: page.total,
+            shown_from: shown_from,
+            shown_to: shown_to,
+            prev: page.prev.clone(),
+            next: page.next.clone(),
+        )
     })
 }
 
@@ -192,6 +297,7 @@ async fn index(cx: &Cx) -> Result<impl View> {
 #[page("/deals/new")]
 async fn new_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let companies = company_options(&mut db).await?;
     let contacts = contact_options(&mut db).await?;
 
@@ -236,17 +342,20 @@ struct DealForm {
 }
 
 /// Read a `company_id`/`contact_id` form field: empty means "none".
-fn form_id(value: String) -> Option<u64> {
-    opt(value).and_then(|id| id.parse().ok())
+fn form_id(value: String) -> Option<i64> {
+    domain::opt(value).and_then(|id| id.parse().ok())
 }
 
 /// Read a `value` form field: empty means zero.
 fn form_money(value: String) -> i64 {
-    opt(value).and_then(|v| parse_money(&v)).unwrap_or(0)
+    domain::opt(value).and_then(|v| domain::parse_money(&v)).unwrap_or(0)
 }
 
 #[route(POST "/deals")]
-async fn create(cx: &Cx, Form(input): Form<DealForm>) -> Result<SeeOther> {
+async fn create(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOther> {
+    let config = crate::config_of(cx);
+    let crate::csrf::CsrfForm(input) = body;
+    let zone = views::zone(cx);
     let title = input.title.trim();
     if title.is_empty() {
         return Err(bad_request("Deal title is required").into());
@@ -258,13 +367,22 @@ async fn create(cx: &Cx, Form(input): Form<DealForm>) -> Result<SeeOther> {
         stage: Stage::parse(input.stage.trim()).unwrap_or(Stage::Lead).as_str(),
         company_id: form_id(input.company_id),
         contact_id: form_id(input.contact_id),
-        expected_close: opt(input.expected_close).and_then(|d| parse_date(&d)),
-        notes: opt(input.notes),
+        // Parsed in the display zone, so the date shown back is the date typed.
+        expected_close: domain::opt(input.expected_close)
+            .and_then(|d| domain::parse_date_in(&d, &zone)),
+        notes: domain::opt(input.notes),
         created_at: domain::now(),
+        created_by: creator(cx),
     })
     .exec(&mut db(cx))
     .await?;
 
+    flash::set(
+        cx,
+        config,
+        flash::Kind::Ok,
+        &format!("Added {}.", deal.title),
+    );
     Ok(see_other(format!("/deals/{}", deal.id)))
 }
 
@@ -275,6 +393,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
     let id = *path_param::<DealId>(cx)?;
     let deal = find(&mut db, id).await?;
+    let zone = views::zone(cx);
 
     let company = match deal.company_id {
         Some(company_id) => Company::filter(Company::fields().id().eq(company_id))
@@ -290,10 +409,8 @@ async fn show(cx: &Cx) -> Result<impl View> {
             .await?,
         None => None,
     };
-    let activities = Activity::filter(Activity::fields().deal_id().eq(Some(id)))
-        .order_by(Activity::fields().created_at().desc())
-        .exec(&mut db)
-        .await?;
+    let panel = activity_panel(&mut db, Activity::fields().deal_id().eq(Some(id)), cx).await?;
+    let (activities, authors) = (panel.activities, panel.authors);
 
     let company_name = company
         .as_ref()
@@ -318,6 +435,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
             <div class="actions">
                 <a class="btn" href=(format!("/deals/{id}/edit"))>"Edit"</a>
                 <form class="inline" method="post" action=(format!("/deals/{id}/delete"))>
+                    csrf_field()
                     <button class="btn btn-danger" type="submit">"Delete"</button>
                 </form>
             </div>
@@ -348,17 +466,22 @@ async fn show(cx: &Cx) -> Result<impl View> {
                             }
                         </dd>
                         <dt>"Expected close"</dt>
-                        <dd>(deal.expected_close.map(domain::format_date).unwrap_or_else(|| "—".to_string()))</dd>
+                        <dd>
+                            (deal.expected_close
+                                .map(|t| zone.format_date(t))
+                                .unwrap_or_else(|| "—".to_string()))
+                        </dd>
                         <dt>"Notes"</dt>
                         <dd>(deal.notes.as_deref().unwrap_or("—"))</dd>
                         <dt>"Created"</dt>
-                        <dd>(domain::format_date(deal.created_at))</dd>
+                        <dd>(zone.format_date(deal.created_at))</dd>
                     </dl>
                 </div>
 
                 <h2>"Move stage"</h2>
                 <div class="panel">
                     <form method="post" action=(format!("/deals/{id}/stage"))>
+                        csrf_field()
                         <div class="form-row">
                             <div class="field">
                                 <label for="stage">"Stage"</label>
@@ -389,7 +512,7 @@ async fn show(cx: &Cx) -> Result<impl View> {
 
                 <h2>"History"</h2>
                 <div class="panel">
-                    activity_feed(activities: activities)
+                    activity_feed(activities: activities, authors: authors, zone: zone)
                 </div>
             </div>
         </div>
@@ -404,11 +527,12 @@ struct StageForm {
 }
 
 #[route(POST "/deals/{deal_id}/stage")]
-async fn set_stage(cx: &Cx, Form(input): Form<StageForm>) -> Result<SeeOther> {
+async fn set_stage(cx: &Cx, body: crate::csrf::CsrfForm<StageForm>) -> Result<SeeOther> {
     let mut db = db(cx);
+    let crate::csrf::CsrfForm(input) = body;
+    auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
-    let stage = Stage::parse(input.stage.trim())
-        .ok_or_else(|| bad_request("Unknown stage"))?;
+    let stage = Stage::parse(input.stage.trim()).ok_or_else(|| bad_request("Unknown stage"))?;
 
     let mut deal = find(&mut db, id).await?;
     toasty::update!(deal { stage: stage.as_str() })
@@ -423,10 +547,12 @@ async fn set_stage(cx: &Cx, Form(input): Form<StageForm>) -> Result<SeeOther> {
 #[page("/deals/{deal_id}/edit")]
 async fn edit_form(cx: &Cx) -> Result<impl View> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
     let deal = find(&mut db, id).await?;
     let companies = company_options(&mut db).await?;
     let contacts = contact_options(&mut db).await?;
+    let zone = views::zone(cx);
 
     Ok(view! {
         <div class="page-head">
@@ -439,7 +565,7 @@ async fn edit_form(cx: &Cx) -> Result<impl View> {
                 title: deal.title.clone(),
                 value: domain::money_input_value(deal.value_cents),
                 stage: deal.stage.clone(),
-                expected_close: domain::date_input_value(deal.expected_close),
+                expected_close: deal.expected_close.map(|t| zone.format_date(t)).unwrap_or_default(),
                 notes: deal.notes.clone().unwrap_or_default(),
                 companies: companies,
                 contacts: contacts,
@@ -452,9 +578,12 @@ async fn edit_form(cx: &Cx) -> Result<impl View> {
 }
 
 #[route(POST "/deals/{deal_id}")]
-async fn update(cx: &Cx, Form(input): Form<DealForm>) -> Result<SeeOther> {
+async fn update(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOther> {
     let mut db = db(cx);
+    let crate::csrf::CsrfForm(input) = body;
+    auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
+    let zone = views::zone(cx);
 
     let title = input.title.trim();
     if title.is_empty() {
@@ -468,8 +597,9 @@ async fn update(cx: &Cx, Form(input): Form<DealForm>) -> Result<SeeOther> {
         stage: Stage::parse(input.stage.trim()).unwrap_or(Stage::Lead).as_str(),
         company_id: form_id(input.company_id),
         contact_id: form_id(input.contact_id),
-        expected_close: opt(input.expected_close).and_then(|d| parse_date(&d)),
-        notes: opt(input.notes),
+        expected_close: domain::opt(input.expected_close)
+            .and_then(|d| domain::parse_date_in(&d, &zone)),
+        notes: domain::opt(input.notes),
     })
     .exec(&mut db)
     .await?;
@@ -482,13 +612,14 @@ async fn update(cx: &Cx, Form(input): Form<DealForm>) -> Result<SeeOther> {
 #[route(POST "/deals/{deal_id}/delete")]
 async fn destroy(cx: &Cx) -> Result<SeeOther> {
     let mut db = db(cx);
+    auth::require_user(cx)?;
     let id = *path_param::<DealId>(cx)?;
 
     for mut activity in Activity::filter(Activity::fields().deal_id().eq(Some(id)))
         .exec(&mut db)
         .await?
     {
-        toasty::update!(activity { deal_id: Option::<u64>::None })
+        toasty::update!(activity { deal_id: Option::<i64>::None })
             .exec(&mut db)
             .await?;
     }
@@ -503,8 +634,8 @@ async fn destroy(cx: &Cx) -> Result<SeeOther> {
 #[component]
 async fn entity_select(
     id: &str,
-    options: Vec<(u64, String)>,
-    selected: Option<u64>,
+    options: Vec<(i64, String)>,
+    selected: Option<i64>,
 ) -> Result<impl View> {
     Ok(view! {
         <select id=(id) name=(id)>
@@ -525,14 +656,15 @@ async fn deal_form(
     stage: String,
     expected_close: String,
     notes: String,
-    companies: Vec<(u64, String)>,
-    contacts: Vec<(u64, String)>,
-    selected_company: Option<u64>,
-    selected_contact: Option<u64>,
+    companies: Vec<(i64, String)>,
+    contacts: Vec<(i64, String)>,
+    selected_company: Option<i64>,
+    selected_contact: Option<i64>,
     submit_label: &str,
 ) -> Result<impl View> {
     Ok(view! {
         <form method="post" action=(action)>
+            csrf_field()
             <div class="field">
                 <label for="title">"Title"</label>
                 <input id="title" name="title" value=(title) required="" autofocus="">
