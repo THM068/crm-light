@@ -1,0 +1,32 @@
+[package]
+name = "crm-light"
+version = "0.1.0"
+edition = "2024"
+default-run = "crm-light"
+
+[lib]
+name = "crm_light"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crm-light"
+path = "src/main.rs"
+
+# Schema-management CLI. Off by default so the normal build stays lean:
+#   cargo run --features cli --bin crm-light-cli -- migration generate
+[[bin]]
+name = "crm-light-cli"
+path = "src/bin/cli.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:toasty-cli", "dep:anyhow"]
+
+[dependencies]
+topcoat = "0.8.1"
+toasty = { version = "0.10.0", features = ["sqlite", "migration"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+toasty-cli = { version = "0.10.0", optional = true }
+anyhow = { version = "1", optional = true }
