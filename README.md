@@ -17,7 +17,22 @@ You need a PostgreSQL server and a database:
 brew services start postgresql@14
 
 createdb crm_light
+cp .env.example .env     # optional: local settings, gitignored
 cargo run
+```
+
+The compiled-in default is `postgresql://localhost/crm_light`, which connects
+over the unix socket — the same thing `psql crm_light` does, and it needs no
+password where the cluster uses peer authentication (Homebrew's and a stock
+Ubuntu install both do). If you want different settings without exporting them
+every time, `cp .env.example .env`: it is read automatically, it is gitignored,
+and the real environment overrides it.
+
+If your cluster does want a password over TCP, `deploy/provision-db.sh` can
+create the role and write the URL straight into `.env`:
+
+```bash
+./deploy/provision-db.sh --out .env      # creates the role, database, and URL
 ```
 
 Then open <http://127.0.0.1:3000> and **create a workspace at `/signup`**. You
@@ -60,6 +75,11 @@ CRM_DB=postgresql://localhost/crm_light_scratch CRM_SEED=0 PORT=4000 cargo run
 A bad value — an unknown `CRM_TZ`, a short `CRM_SECRET_KEY`, a `CRM_PAGE_SIZE`
 of `0` — stops the process at boot with a message naming the variable, rather
 than being silently ignored.
+
+### Running it under `topcoat dev`
+
+`topcoat dev` rebuilds and reloads, and reads the same environment, so the
+settings above apply unchanged.
 
 ### Tests
 

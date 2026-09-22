@@ -234,6 +234,18 @@ Migrations are applied at startup and are idempotent, so a restart is the
 upgrade. That also means **a restart is a schema change**: take a backup before
 deploying one, because rolling back the binary does not roll back the schema.
 
+**Using the same script for local development.** `--out` puts the generated
+connection string wherever you like, and `.env` in the repository root is read
+automatically by `cargo run`, so the local and server setups come from the same
+place:
+
+```bash
+./deploy/provision-db.sh --out .env      # no sudo needed if your role can create roles
+cargo run
+```
+
+`.env` is gitignored because it contains the password.
+
 **Testing the scripts without a server.** `provision-db.sh` runs `psql` through
 `sudo -u postgres` by default, which is what a stock Ubuntu cluster wants.
 Setting `CRM_PG_SUPERUSER` names a superuser role to connect as instead, which

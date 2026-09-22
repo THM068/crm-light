@@ -7,6 +7,11 @@
 *.db-wal
 *.db-shm
 
+# Local development settings: may contain a database password.
+# `.env.example` is tracked as the template.
+.env
+.env.local
+
 # Editor / OS noise
 .DS_Store
 .idea/

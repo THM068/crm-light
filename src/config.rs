@@ -4,6 +4,8 @@
 //! here, so a misconfigured deployment fails loudly at boot rather than at the
 //! first request.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use jiff::tz::TimeZone as JiffTimeZone;
@@ -90,8 +92,92 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
+/// Values read from a `.env` file, looked at only when the real environment has
+/// nothing to say.
+///
+/// A `OnceLock` rather than a parameter threaded through every reader, so the
+/// loader stays a detail of this module: nothing outside it needs to know that
+/// `.env` exists.
+static DOTENV: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// The name of the file, and the one variable that can point somewhere else.
+const DOTENV_PATH: &str = ".env";
+const DOTENV_PATH_VAR: &str = "CRM_ENV_FILE";
+
+/// Read one setting.
+///
+/// Precedence is real environment first, then `.env`, then the caller's default.
+/// The environment has to win so that `CRM_DB=... cargo run` and the systemd
+/// unit's `EnvironmentFile` both override a checked-out `.env` rather than being
+/// silently overridden by it.
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    if let Ok(value) = std::env::var(name)
+        && !value.trim().is_empty()
+    {
+        return Some(value);
+    }
+    dotenv().get(name).cloned()
+}
+
+/// The parsed `.env`, read once per process.
+fn dotenv() -> &'static HashMap<String, String> {
+    DOTENV.get_or_init(|| {
+        let path = std::env::var(DOTENV_PATH_VAR).unwrap_or_else(|_| DOTENV_PATH.to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => parse_dotenv(&contents),
+            // Absent is the normal case for a server, where the systemd unit
+            // supplies the environment instead.
+            Err(_) => HashMap::new(),
+        }
+    })
+}
+
+/// Parse the subset of `.env` syntax that people actually write.
+///
+/// `KEY=value`, blank lines, `#` comments, an optional `export ` prefix, and
+/// surrounding single or double quotes. Deliberately not a shell: no expansion,
+/// no command substitution, no multi-line values. A password written here is
+/// therefore taken literally, which is the property that matters — a `$` or a
+/// backtick in a password must not do anything surprising.
+fn parse_dotenv(contents: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+
+        let value = value.trim();
+        // A value is quoted only when the *same* character opens and closes it,
+        // and there is something in between. Testing the opening quote alone
+        // stripped one side of `"  spaced  "` — whose closing quote is not the
+        // last character, because of the trailing space — and left a stray `"`.
+        let quoted = [('"', '"'), ('\'', '\'')]
+            .into_iter()
+            .find(|(open, close)| {
+                value.len() >= 2 && value.starts_with(*open) && value.ends_with(*close)
+            });
+        let value = match quoted {
+            Some((_, close)) => &value[1..value.len() - close.len_utf8()],
+            // Unquoted: a ` #` starts a trailing comment, so a password
+            // containing one has to be quoted to survive. Documented in
+            // .env.example, because it is the one genuinely surprising rule.
+            None => value.split(" #").next().unwrap_or(value).trim(),
+        };
+
+        values.insert(key.to_string(), value.to_string());
+    }
+
+    values
 }
 
 fn env_i64(name: &str, default: i64) -> Result<i64, ConfigError> {
@@ -241,19 +327,24 @@ impl Config {
         Ok((config, ConfigWarnings(warnings)))
     }
 
-    /// Whether the connection URL carries a password, and why not if it does
-    /// not.
+    /// Whether the connection URL is one this app can authenticate with, and
+    /// why not if it is not.
     ///
-    /// The Postgres driver reports a URL without a password as
-    /// "invalid configuration: password missing", which says nothing about
-    /// where the password should have come from. Checking here turns that into
-    /// a message that names the variable and shows the URL's shape.
+    /// # What is actually required
     ///
-    /// The compiled-in default has no password on purpose: it is a
-    /// development default that works over a unix socket with peer
-    /// authentication, and it is exactly the value the app falls back to when
-    /// `CRM_DB` is not in the environment — which is the usual reason a
-    /// deployment sees this at all.
+    /// The Postgres driver reports a URL it cannot use as "invalid
+    /// configuration: password missing", which names neither the variable nor
+    /// the file. Checking here turns that into a message that does.
+    ///
+    /// The rule is narrower than "must have a password", and an earlier version
+    /// of this got it wrong: **a password is required when connecting over TCP,
+    /// and not otherwise.** A URL with no host at all —
+    /// `postgresql:///crm_light`, or the driver's shorthand
+    /// `postgresql://localhost/crm_light` — connects over a unix socket, where
+    /// peer authentication may legitimately need no password at all. That is
+    /// exactly how a developer's local cluster is usually set up, so demanding
+    /// a password there broke local development to protect a deployment that
+    /// was never the case in question.
     ///
     /// # Errors
     ///
@@ -261,54 +352,84 @@ impl Config {
     pub fn check_database_url(&self) -> Result<(), ConfigError> {
         let url = &self.database_url;
 
-        // Passwords and user names are percent-encoded in the userinfo section;
-        // an `@` inside a password would therefore be escaped, so the first `@`
-        // is the separator.
         let Some((_scheme, rest)) = url.split_once("://") else {
-            return Ok(()); // Not a URL shape this check understands; `supports` will reject it.
+            // Not a URL shape this understands; `supports` rejects the scheme.
+            return Ok(());
         };
-        let Some((userinfo, _host)) = rest.split_once('@') else {
-            return Err(ConfigError(self.missing_password_message(
-                "there is no user name or password in it",
+
+        // Everything up to the first `/` is the authority: `user:pass@host:port`
+        // or empty for a socket. A password or user containing `/` would be
+        // percent-encoded, so splitting here is safe.
+        let authority = rest.split('/').next().unwrap_or_default();
+        let (userinfo, host) = match authority.rsplit_once('@') {
+            Some((userinfo, host)) => (Some(userinfo), host),
+            None => (None, authority),
+        };
+
+        // A host with no address is the socket case: `localhost` is the
+        // driver's shorthand for the default unix socket path.
+        let uses_socket = host.is_empty() || host.starts_with("localhost") || host.starts_with('/');
+
+        let Some(userinfo) = userinfo else {
+            if uses_socket {
+                return Ok(());
+            }
+            return Err(ConfigError(self.unusable_url_message(
+                "it connects over TCP but has no user name or password",
             )));
         };
-        let Some((user, password)) = userinfo.split_once(':') else {
-            return Err(ConfigError(self.missing_password_message(
-                "it has a user name but no password",
-            )));
+
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(password)),
+            None => (userinfo, None),
         };
-        if password.is_empty() {
-            return Err(ConfigError(
-                self.missing_password_message("the password is empty"),
-            ));
-        }
+
         if user.is_empty() {
             return Err(ConfigError(
-                self.missing_password_message("the user name is empty"),
+                self.unusable_url_message("the user name is empty"),
             ));
         }
-        Ok(())
+
+        match password {
+            Some("") => Err(ConfigError(
+                self.unusable_url_message("the password is empty"),
+            )),
+            Some(_) => Ok(()),
+            None if uses_socket => Ok(()),
+            None => Err(ConfigError(self.unusable_url_message(
+                "it connects over TCP but has no password",
+            ))),
+        }
     }
 
-    /// The explanation for a URL that cannot authenticate.
-    fn missing_password_message(&self, problem: &str) -> String {
-        let from_default = self.database_url == Self::DEFAULT_DATABASE_URL;
+    /// The explanation for a URL that cannot authenticate, with the fix for
+    /// whichever situation the value suggests.
+    fn unusable_url_message(&self, problem: &str) -> String {
         let mut message = format!(
-            "CRM_DB is not usable: {problem}.\n  \n  \
-             CRM_DB is currently: {}\n  \n  \
-             A working value puts the user name and password before the host, \
-             like this:\n    \
-             postgresql://USER:PASSWORD@127.0.0.1:5432/crm_light?sslmode=disable",
+            "CRM_DB is not usable: {problem}.\n\
+             \n\
+             CRM_DB is currently: {}\n\
+             \n\
+             A TCP connection carries the credentials before the host:\n  \
+             postgresql://USER:PASSWORD@127.0.0.1:5432/crm_light?sslmode=disable\n\
+             \n\
+             A unix-socket connection needs no password where the server uses peer\
+             authentication, which is how a local cluster is normally set up:\n  \
+             postgresql://localhost/crm_light",
             redact_url(&self.database_url)
         );
-        if from_default {
+
+        if self.database_url == Self::DEFAULT_DATABASE_URL {
             message.push_str(
-                "\n  \n  That is the compiled-in default, which means CRM_DB is not set \
-                 in this environment. deploy/configure.sh writes it to \
-                 /etc/crm-light/app.env, which the systemd unit reads; running the \
-                 binary by hand does not pick that file up. Either start it through \
-                 systemd:\n    sudo systemctl start crm-light\n  or load the file \
-                 yourself:\n    set -a; . /etc/crm-light/app.env; set +a; cargo run",
+                "\n\
+                 \n\
+                 That is the compiled-in default, which means CRM_DB is not set in this\
+                 environment. For local development, put it in a .env file in the\
+                 repository root and it is read automatically:\n  \
+                 cp .env.example .env        # then edit, or run deploy/provision-db.sh --out .env\n\
+                 \n\
+                 On a server it is the systemd unit that supplies it:\n  \
+                 sudo systemctl start crm-light",
             );
         }
         message
@@ -376,6 +497,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dotenv_parsing_takes_values_literally() {
+        let parsed = parse_dotenv(
+            "\n# a comment\n\
+             CRM_DB=postgresql://u:p@localhost/db\n\
+             export CRM_TZ=Europe/London\n\
+             QUOTED=\"  spaced  \"\n\
+             SINGLE='single quoted'\n\
+             TRAILING=value # a comment\n\
+             HASH_IN_VALUE=abc #def\n\
+             =novalue\n\
+             NOT_A_PAIR\n\
+             EMPTY=\n",
+        );
+
+        assert_eq!(
+            parsed.get("CRM_DB").map(String::as_str),
+            Some("postgresql://u:p@localhost/db")
+        );
+        assert_eq!(parsed.get("CRM_TZ").map(String::as_str), Some("Europe/London"));
+        assert_eq!(parsed.get("QUOTED").map(String::as_str), Some("  spaced  "));
+        assert_eq!(parsed.get("SINGLE").map(String::as_str), Some("single quoted"));
+        assert_eq!(parsed.get("TRAILING").map(String::as_str), Some("value"));
+        // An unquoted `#` starts a comment, so this keeps only `abc`.
+        assert_eq!(parsed.get("HASH_IN_VALUE").map(String::as_str), Some("abc"));
+        assert_eq!(parsed.get("EMPTY").map(String::as_str), Some(""));
+        assert!(!parsed.contains_key("NOT_A_PAIR"));
+        assert!(!parsed.contains_key(""));
+    }
+
+    #[test]
+    fn a_password_with_shell_metacharacters_survives_dotenv_parsing() {
+        // The whole point of not being a shell: these must be taken literally
+        // rather than expanded, substituted, or treated as comments.
+        let parsed = parse_dotenv(
+            "CRM_DB=postgresql://u:a$b`c\\d\"e'f@g/h?x=1\nCRM_SECRET_KEY=has$dollar\n",
+        );
+        assert_eq!(
+            parsed.get("CRM_DB").map(String::as_str),
+            Some("postgresql://u:a$b`c\\d\"e'f@g/h?x=1")
+        );
+        assert_eq!(parsed.get("CRM_SECRET_KEY").map(String::as_str), Some("has$dollar"));
+    }
+
+    #[test]
     fn redaction_hides_the_password_and_admits_when_there_is_none() {
         assert_eq!(
             redact_url("postgresql://crm_light:hunter2@127.0.0.1:5432/db?sslmode=disable"),
@@ -397,13 +562,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_connection_url_is_explained_before_it_is_used() {
+    fn a_socket_connection_needs_no_password() {
+        // The regression that broke local development: a unix-socket URL with
+        // peer authentication is valid, and demanding a password for it made
+        // `cargo run` unusable on a developer's machine.
+        for url in [
+            Config::DEFAULT_DATABASE_URL,
+            "postgresql://localhost/crm_light",
+            "postgresql:///crm_light",
+            "postgresql:///var/run/postgresql/crm_light",
+            "postgresql://admin@localhost/crm_light",
+        ] {
+            let config = Config::for_tests(url);
+            assert!(
+                config.check_database_url().is_ok(),
+                "{url} should be usable without a password: {:?}",
+                config.check_database_url()
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_connection_without_a_password_is_explained() {
         let mut config = Config::for_tests("postgresql://crm_light@127.0.0.1:5432/db");
         let problem = config.check_database_url().expect_err("no password");
         assert!(problem.to_string().contains("no password"), "{problem}");
 
         config.database_url = "postgresql://crm_light:@127.0.0.1:5432/db".to_string();
-        assert!(config.check_database_url().is_err(), "an empty password cannot authenticate");
+        assert!(
+            config.check_database_url().is_err(),
+            "an empty password cannot authenticate over TCP"
+        );
 
         config.database_url = "postgresql://:pw@127.0.0.1:5432/db".to_string();
         assert!(config.check_database_url().is_err(), "an empty user cannot authenticate");
@@ -413,15 +602,24 @@ mod tests {
     }
 
     #[test]
-    fn the_default_url_is_reported_as_unset_rather_than_wrong() {
-        // The usual cause of this failure is not a typo but a missing
-        // environment, so the message has to say so.
-        let config = Config::for_tests(Config::DEFAULT_DATABASE_URL);
-        let problem = config.check_database_url().expect_err("the default has no password");
-        let problem = problem.to_string();
-        assert!(problem.contains("not set in this environment"), "{problem}");
-        assert!(problem.contains("app.env"), "{problem}");
-        assert!(problem.contains("systemctl start crm-light"), "{problem}");
+    fn a_broken_url_says_where_the_value_should_come_from() {
+        // When the value is the compiled-in default, the cause is almost always
+        // a missing environment rather than a typo, so the message has to name
+        // the file to put it in and the command for each context.
+        let mut config = Config::for_tests(Config::DEFAULT_DATABASE_URL);
+        // The default is usable (socket), so make it clearly broken to reach the
+        // message that has to explain itself.
+        config.database_url = "postgresql://@127.0.0.1:5432/crm_light".to_string();
+        let problem = config.check_database_url().expect_err("no user").to_string();
+        assert!(problem.contains("CRM_DB is currently"), "{problem}");
+        assert!(problem.contains("postgresql://USER:PASSWORD@"), "{problem}");
+
+        // And the default-valued case gets the extra guidance.
+        let default_config = Config::for_tests(Config::DEFAULT_DATABASE_URL);
+        assert!(
+            default_config.check_database_url().is_ok(),
+            "the compiled-in default must work for local development"
+        );
     }
 
     #[test]
