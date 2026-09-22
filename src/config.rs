@@ -56,6 +56,9 @@ pub struct Config {
 
     /// Insert the demo dataset when the database has no companies.
     pub seed_demo_data: bool,
+
+    /// Where AI briefings come from, and what they may cost.
+    pub ai: crate::ai::AiConfig,
 }
 
 /// Why the configuration could not be used.
@@ -193,6 +196,20 @@ impl Config {
             );
         }
 
+        let ai_timeout_secs = env_i64("CRM_AI_TIMEOUT_SECONDS", 45)?;
+        if !(5..=300).contains(&ai_timeout_secs) {
+            return Err(ConfigError(
+                "CRM_AI_TIMEOUT_SECONDS must be between 5 and 300".to_string(),
+            ));
+        }
+
+        let ai_max_tokens = env_i64("CRM_AI_MAX_TOKENS", 700)?;
+        if !(64..=8192).contains(&ai_max_tokens) {
+            return Err(ConfigError(
+                "CRM_AI_MAX_TOKENS must be between 64 and 8192".to_string(),
+            ));
+        }
+
         let allow_signup = env_bool("CRM_ALLOW_SIGNUP", true)?;
         if allow_signup {
             warnings.push(
@@ -201,6 +218,28 @@ impl Config {
                  workspaces you want exist."
                     .to_string(),
             );
+        }
+
+        // The key is the on/off switch: without it the feature is unavailable
+        // rather than failing when somebody presses the button. There is no
+        // default key and none is read from anywhere but the environment, so
+        // this is off unless somebody deliberately turns it on.
+        let ai = crate::ai::AiConfig {
+            api_key: env("CRM_AI_API_KEY"),
+            model: env("CRM_AI_MODEL")
+                .unwrap_or_else(|| crate::ai::AiConfig::DEFAULT_MODEL.to_string()),
+            base_url: env("CRM_AI_BASE_URL")
+                .unwrap_or_else(|| crate::ai::AiConfig::DEFAULT_BASE_URL.to_string()),
+            timeout: Duration::from_secs(ai_timeout_secs as u64),
+            max_tokens: ai_max_tokens as u32,
+        };
+        if ai.is_enabled() {
+            warnings.push(format!(
+                "CRM_AI_API_KEY is set, so \"Generate AI briefing\" is available and sends a \
+                 contact's name, notes, deals, and recent activity to {} ({}) when somebody \
+                 presses it. That is customer data leaving this server.",
+                ai.base_url, ai.model
+            ));
         }
 
         let config = Self {
@@ -216,6 +255,7 @@ impl Config {
             allow_signup,
             // `CRM_SEED=0` disables; anything else (including unset) seeds.
             seed_demo_data: env("CRM_SEED").as_deref() != Some("0"),
+            ai,
         };
 
         Ok((config, ConfigWarnings(warnings)))
@@ -274,6 +314,13 @@ impl Config {
             allow_passwordless_login: true,
             allow_signup: true,
             seed_demo_data: false,
+            ai: crate::ai::AiConfig {
+                api_key: None,
+                model: crate::ai::AiConfig::DEFAULT_MODEL.to_string(),
+                base_url: crate::ai::AiConfig::DEFAULT_BASE_URL.to_string(),
+                timeout: Duration::from_secs(5),
+                max_tokens: 256,
+            },
         }
     }
 }

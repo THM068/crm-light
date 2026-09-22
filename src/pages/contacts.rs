@@ -9,7 +9,7 @@ use crate::auth;
 use crate::db;
 use crate::domain;
 use crate::flash;
-use crate::models::{Activity, Company, Contact, Deal};
+use crate::models::{Activity, Briefing, Company, Contact, Deal};
 use crate::pages::{Pagination, activity_panel, creator};
 use crate::pagination::{self, Sort};
 use crate::search::CaseInsensitiveLike;
@@ -18,7 +18,7 @@ use topcoat::{
     Result,
     context::Cx,
     router::{
-        error::{SeeOther, bad_request, see_other},
+        error::{SeeOther, bad_request, not_found, see_other},
         page, path_param, query_params, route,
     },
     view::{View, component, view},
@@ -375,6 +375,41 @@ async fn show(cx: &Cx) -> Result<impl View> {
     .await?;
     let (activities, authors) = (panel.activities, panel.authors);
 
+    // The newest briefing for this contact, if one has been generated. Scoped
+    // like everything else, and ordered by id rather than created_at so two
+    // briefings in the same second still have a defined order.
+    let briefing = Briefing::filter(
+        Briefing::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Briefing::fields().contact_id().eq(id)),
+    )
+    .order_by(Briefing::fields().id().desc())
+    .first()
+    .exec(&mut db)
+    .await?;
+
+    // A briefing is a mutation, so it needs the CSRF token and the feature has
+    // to be configured; both are decided here rather than in the template.
+    let ai_enabled = crate::config_of(cx).ai.is_enabled();
+    let briefing_bullets = briefing
+        .as_ref()
+        .map(|briefing| crate::ai::Briefing::from_text(&briefing.bullets))
+        .unwrap_or_default();
+    let briefing_when = briefing
+        .as_ref()
+        .map(|briefing| zone.format_datetime(briefing.created_at))
+        .unwrap_or_default();
+    let briefing_model = briefing
+        .as_ref()
+        .map(|briefing| briefing.model.clone())
+        .unwrap_or_default();
+    // Who asked for it, by name.
+    let briefing_author = match briefing.as_ref().and_then(|briefing| briefing.created_by) {
+        Some(user_id) => views::user_name(&mut db, user_id).await?,
+        None => None,
+    };
+
     Ok(view! {
         <div class="page-head">
             <h1>(domain::full_name(&contact.first_name, &contact.last_name))</h1>
@@ -434,6 +469,19 @@ async fn show(cx: &Cx) -> Result<impl View> {
             </div>
 
             <div>
+                <h2>"AI briefing"</h2>
+                <div class="panel">
+                    crate::views::briefing_panel(
+                        action: format!("/contacts/{id}/briefing"),
+                        enabled: ai_enabled,
+                        bullets: briefing_bullets,
+                        when: briefing_when,
+                        model: briefing_model,
+                        author: briefing_author,
+                        has_history: !activities.is_empty() || !deals.is_empty(),
+                    )
+                </div>
+
                 <h2>"Log activity"</h2>
                 <div class="panel">
                     activity_form(
@@ -451,6 +499,142 @@ async fn show(cx: &Cx) -> Result<impl View> {
             </div>
         </div>
     })
+}
+
+// --- AI briefing -----------------------------------------------------------
+
+/// Generate a briefing for this contact and store it.
+///
+/// ### Why this is a POST that redirects rather than a fragment swap
+///
+/// It costs one provider request and takes seconds, so it has to be an explicit
+/// action rather than something a page load triggers — a GET would let a
+/// crawler, a link prefetch, or a refresh spend money. The work happens here and
+/// the result is stored, so a reload shows the briefing instead of buying
+/// another one.
+///
+/// ### What it refuses to guess
+///
+/// With no API key the feature is off and this answers 404 rather than an error
+/// a user can do nothing about. With no history there is nothing to summarise,
+/// so it says so rather than paying a model to invent something.
+/// The briefing request has no fields of its own — everything it needs is the
+/// contact in the path — but the handler still has to *take a body*.
+///
+/// That is not decoration. The CSRF check lives in the form extractor, and the
+/// route macro only runs an extractor for a handler that declares a body
+/// parameter. Written without one, this route accepted a token-less `POST` and
+/// generated a briefing: a cross-site page could have spent somebody's API
+/// credit. `CsrfForm` here is what makes the token required, and the payload
+/// being empty is incidental.
+#[derive(Deserialize)]
+struct BriefingForm {}
+
+#[route(POST "/contacts/{contact_id}/briefing")]
+async fn generate_briefing(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<BriefingForm>,
+) -> Result<SeeOther> {
+    // The extractor has already validated the token by the time this runs.
+    let crate::csrf::CsrfForm(BriefingForm {}) = body;
+    let mut db = db(cx);
+    let tenant = Tenant::of(cx)?;
+    let config = crate::config_of(cx);
+    let back = format!(
+        "/contacts/{}",
+        *path_param::<ContactId>(cx)?
+    );
+
+    if !config.ai.is_enabled() {
+        // The same answer as a route that does not exist, because with the
+        // feature off this one effectively does not.
+        return Err(not_found().into());
+    }
+
+    let id = *path_param::<ContactId>(cx)?;
+    let contact = find(&mut db, tenant, id).await?;
+
+    let company = match contact.company_id {
+        Some(company_id) => Company::filter(
+            Company::fields()
+                .account_id()
+                .eq(tenant.account_id)
+                .and(Company::fields().id().eq(company_id)),
+        )
+        .first()
+        .exec(&mut db)
+        .await?,
+        None => None,
+    };
+
+    // The same rows the page shows, so the briefing describes what a reader can
+    // see rather than something they cannot check.
+    let deals = Deal::filter(
+        Deal::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Deal::fields().contact_id().eq(id)),
+    )
+    .order_by(Deal::fields().created_at().desc())
+    .exec(&mut db)
+    .await?;
+
+    let activities = Activity::filter(
+        Activity::fields()
+            .account_id()
+            .eq(tenant.account_id)
+            .and(Activity::fields().contact_id().eq(Some(id))),
+    )
+    .order_by(Activity::fields().created_at().desc())
+    .limit(crate::ai::MAX_ACTIVITIES)
+    .exec(&mut db)
+    .await?;
+
+    if activities.is_empty() && deals.is_empty() && contact.notes.is_none() {
+        flash::set(
+            cx,
+            config,
+            flash::Kind::Warn,
+            "There is nothing recorded for this contact yet, so there is no briefing to write. \
+             Log an activity or add a deal first.",
+        );
+        return Ok(see_other(back));
+    }
+
+    let zone = views::zone(cx);
+    let prompt = crate::ai::build_prompt(&contact, company.as_ref(), &deals, &activities, &zone);
+
+    // Whatever the provider does — refuse, time out, or return nonsense — the
+    // user gets a sentence they can act on rather than a 500 that loses the
+    // page they were on.
+    let briefing = match crate::ai::generate(crate::http(cx), &config.ai, &prompt).await {
+        Ok(briefing) => briefing,
+        Err(error) => {
+            flash::set(
+                cx,
+                config,
+                flash::Kind::Error,
+                &format!("Could not write a briefing: {error}"),
+            );
+            return Ok(see_other(back));
+        }
+    };
+
+    toasty::create!(Briefing {
+        account_id: tenant.account_id,
+        contact_id: id,
+        bullets: briefing.to_text(),
+        model: config.ai.model.clone(),
+        prompt_tokens: briefing.prompt_tokens,
+        completion_tokens: briefing.completion_tokens,
+        created_at: domain::now(),
+        created_by: Some(tenant.user_id),
+    })
+    .exec(&mut db)
+    .await?;
+
+    flash::set(cx, config, flash::Kind::Ok, "Briefing written.");
+    Ok(see_other(back))
 }
 
 // --- Edit ------------------------------------------------------------------
@@ -528,7 +712,13 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<ContactForm>) -> Result<See
 // --- Delete ----------------------------------------------------------------
 
 #[route(POST "/contacts/{contact_id}/delete")]
-async fn destroy(cx: &Cx) -> Result<SeeOther> {
+async fn destroy(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = db(cx);
     let tenant = Tenant::of(cx)?;
 

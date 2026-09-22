@@ -28,6 +28,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod access;
+pub mod ai;
 pub mod auth;
 pub mod config;
 pub mod csrf;
@@ -52,9 +53,25 @@ use topcoat::{
 ///
 /// Registered as app context, so it is the same value for every request and
 /// costs nothing to read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct App {
     pub config: config::Config,
+    /// One HTTP client for the process, so connections to the AI provider are
+    /// pooled and the timeout applies everywhere. Built at startup rather than
+    /// per request, which is what makes the timeout a property of the process
+    /// rather than of whoever remembered to set one.
+    pub http: reqwest::Client,
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `reqwest::Client` is not `Debug`, and the config's `Debug` includes
+        // the AI key, so this deliberately prints neither.
+        f.debug_struct("App")
+            .field("config", &"<redacted>")
+            .field("http", &"reqwest::Client")
+            .finish()
+    }
 }
 
 /// The database handle.
@@ -71,6 +88,11 @@ pub fn db(cx: &Cx) -> Db {
 /// every caller shares the one value.
 pub fn config_of(cx: &Cx) -> &config::Config {
     &app_context::<App>(cx).config
+}
+
+/// The shared HTTP client, for calls to the AI provider.
+pub fn http(cx: &Cx) -> &reqwest::Client {
+    &app_context::<App>(cx).http
 }
 
 /// The single layout wrapping every page.
@@ -372,6 +394,18 @@ textarea { min-height: 5rem; resize: vertical; }
   margin: 0 0 1.25rem;
 }
 .error-actions { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; }
+
+.briefing { margin: 0 0 0.75rem; padding-left: 1.15rem; }
+.briefing li { margin-bottom: 0.4rem; }
+.briefing-meta { color: var(--muted); font-size: 0.82rem; margin: 0 0 0.75rem; }
+.briefing-meta code, .hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: #f2f4f7;
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.hint { color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0 0; }
 
 dl.meta { display: grid; grid-template-columns: 9rem 1fr; gap: 0.35rem 1rem; margin: 0; }
 dl.meta dt { color: var(--muted); font-size: 0.88rem; }

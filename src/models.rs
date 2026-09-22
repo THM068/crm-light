@@ -241,6 +241,45 @@ pub struct Deal {
     pub created_by: Option<i64>,
 }
 
+/// An AI-generated summary of where a contact's deal stands.
+///
+/// Stored rather than regenerated on every page view: the text is a snapshot of
+/// the interaction history at the moment it was written, it costs a request to
+/// produce, and keeping it makes "when was this written, and against what?"
+/// answerable later. A newer briefing for the same contact supersedes the
+/// older ones without deleting them.
+#[derive(Debug, toasty::Model)]
+pub struct Briefing {
+    #[key]
+    #[auto]
+    pub id: i64,
+
+    /// The tenant, so briefings are scoped and isolated like everything else.
+    #[index]
+    pub account_id: i64,
+
+    #[index]
+    pub contact_id: i64,
+
+    /// Exactly three bullet points, one per line, as returned by the model.
+    pub bullets: String,
+
+    /// Which model produced it, so a later reader can tell whether the text
+    /// came from the same model they are looking at now.
+    pub model: String,
+
+    /// Tokens the API reported, for watching cost. `None` when the provider did
+    /// not report usage.
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+
+    pub created_at: i64,
+
+    /// Who asked for it.
+    #[index]
+    pub created_by: Option<i64>,
+}
+
 /// A logged interaction, optionally attached to a contact, company, or deal.
 #[derive(Debug, toasty::Model)]
 pub struct Activity {

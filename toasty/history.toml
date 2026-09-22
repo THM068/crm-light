@@ -1,11 +1,11 @@
 version = 1
 
 [[migrations]]
-id = 6812258738138711042
+id = 5158914139429238092
 name = "0000_migration.sql"
 snapshot_name = "0000_snapshot.toml"
 
 [[migrations]]
-id = 6706132347034735827
+id = 1645455760870039706
 name = "0001_extra_indexes.sql"
 snapshot_name = "0001_snapshot.toml"

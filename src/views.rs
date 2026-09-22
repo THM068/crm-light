@@ -224,7 +224,29 @@ pub async fn author_names(
         return Ok(HashMap::new());
     }
 
-    let users = User::filter(User::fields().id().in_list(ids))
+    user_names_for(db, &ids).await
+}
+
+/// One person's display name, for the places that name a single author — a
+/// briefing's requester, say.
+///
+/// # Errors
+///
+/// Propagates database errors. An id with no matching row yields `None`, which
+/// happens for a person who has since been deleted.
+pub async fn user_name(db: &mut toasty::Db, user_id: i64) -> toasty::Result<Option<String>> {
+    Ok(user_names_for(db, &[user_id]).await?.remove(&user_id))
+}
+
+/// Display names for a set of user ids, in one query.
+async fn user_names_for(
+    db: &mut toasty::Db,
+    ids: &[i64],
+) -> toasty::Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let users = User::filter(User::fields().id().in_list(ids.to_vec()))
         .exec(db)
         .await?;
     Ok(users
@@ -272,6 +294,81 @@ pub async fn activity_form(
             </div>
             <button class="btn btn-primary" type="submit">"Log activity"</button>
         </form>
+    })
+}
+
+// --- AI briefing -----------------------------------------------------------
+
+/// The briefing panel on a contact page: the latest summary, and the button
+/// that asks for a new one.
+///
+/// Three states, all decided by the caller so the template stays a render:
+/// the feature is off, there is no briefing yet, or there is one to show.
+///
+/// The form's `onsubmit` is a progressive enhancement, not a requirement: the
+/// button works with JavaScript disabled, it just gives no feedback while the
+/// model is thinking. Disabling it on submit is the cheap way to stop a second
+/// press from paying for a second generation.
+#[component]
+pub async fn briefing_panel(
+    action: String,
+    enabled: bool,
+    bullets: Vec<String>,
+    when: String,
+    model: String,
+    author: Option<String>,
+    has_history: bool,
+) -> Result<impl View> {
+    let generate = if bullets.is_empty() {
+        "Generate AI briefing"
+    } else {
+        "Regenerate"
+    };
+
+    Ok(view! {
+        if !enabled {
+            <p class="empty">
+                "AI briefings are off. Set " <code>"CRM_AI_API_KEY"</code> " and restart to \
+                 enable them."
+            </p>
+        } else {
+            if bullets.is_empty() {
+                <p class="muted">
+                    "A short summary of where this deal stands and what to do next, written \
+                     from the activity and deals below."
+                </p>
+                if !has_history {
+                    <p class="empty">
+                        "There is nothing recorded for this contact yet, so a briefing would \
+                         have nothing to work from."
+                    </p>
+                }
+            } else {
+                <ul class="briefing">
+                    for bullet in &bullets {
+                        <li>(bullet)</li>
+                    }
+                </ul>
+                <p class="briefing-meta">
+                    "Written " (when)
+                    if let Some(author) = author {
+                        " by " (author)
+                    }
+                    " using " <code>(model)</code>
+                </p>
+            }
+
+            <form method="post" action=(action)
+                  onsubmit="this.querySelector('button').disabled = true;
+                            this.querySelector('button').textContent = 'Asking the model…';">
+                csrf_field()
+                <button class="btn btn-primary" type="submit">(generate)</button>
+            </form>
+            <p class="hint">
+                "This sends this contact's name, notes, deals, and recent activity to your \
+                 configured AI provider."
+            </p>
+        }
     })
 }
 

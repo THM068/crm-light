@@ -38,3 +38,8 @@ CREATE INDEX "index_activities_by_account_id_id" ON "activities" ("account_id", 
 CREATE INDEX "index_companies_by_account_name" ON "companies" ("account_id", "name");
 CREATE INDEX "index_contacts_by_account_last_name" ON "contacts" ("account_id", "last_name");
 CREATE INDEX "index_sessions_by_account_token" ON "sessions" ("account_id", "token_hash");
+
+-- The contact page's "newest briefing for this contact" lookup: the tenant and
+-- the contact together, newest first.
+CREATE INDEX "index_briefings_by_account_contact_id"
+    ON "briefings" ("account_id", "contact_id", "id" DESC);

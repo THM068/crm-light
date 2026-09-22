@@ -245,6 +245,19 @@ defaults that are wrong for one:
 | `CRM_SEED` | `0` | Otherwise the demo companies are inserted into your real installation. |
 | `HOST` | `127.0.0.1` | Otherwise the app is reachable around the proxy, without TLS. |
 | `CRM_TZ` | your zone | So dates read the way your team writes them. Storage stays UTC. |
+| `CRM_AI_API_KEY` | unset, or a key | Unset keeps AI briefings off. Setting it sends a contact's notes, deals, and recent activity to the configured provider when somebody presses the button — customer data leaving your server, so decide deliberately. |
+
+To enable briefings on the server, add the key to the app's env file and
+restart:
+
+```bash
+sudo sh -c 'echo "CRM_AI_API_KEY=sk-your-key" >> /etc/crm-light/app.env'
+sudo systemctl restart crm-light
+journalctl -u crm-light -n 5 | grep CRM_AI     # confirms it is on
+```
+
+Nothing else is needed: the key is the whole switch. Leave it out and the
+feature is absent rather than broken.
 
 ---
 

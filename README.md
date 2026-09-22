@@ -44,6 +44,11 @@ until somebody has signed up. Set `CRM_SEED=0` to skip it entirely.
 | `CRM_LOGIN_MAX_ATTEMPTS`    | `8`                                    | Failed sign-ins before an account is temporarily locked.              |
 | `CRM_LOGIN_LOCKOUT_MINUTES` | `15`                                   | How long that lock lasts.                                             |
 | `CRM_ALLOW_SIGNUP`          | `1`                                    | Whether a stranger may create a workspace at `/signup`. **Set to `0` on any server the internet can reach.** |
+| `CRM_AI_API_KEY`            | unset                                  | Enables AI briefings. **Unset means the feature is off.** |
+| `CRM_AI_MODEL`              | `deepseek-chat`                        | Model used for briefings. |
+| `CRM_AI_BASE_URL`           | `https://api.deepseek.com`             | Any OpenAI-compatible endpoint, including a local one. |
+| `CRM_AI_TIMEOUT_SECONDS`    | `45`                                   | Whole-request budget for one briefing (5–300). |
+| `CRM_AI_MAX_TOKENS`         | `700`                                  | Ceiling on the model's reply (64–8192). |
 | `CRM_ALLOW_EMPTY_PASSWORD`  | `1`                                    | Whether an account with no stored password may sign in with a blank one. Nothing creates such an account, so this only matters for rows left by an older version. |
 | `CRM_SEED`                  | unset (on)                             | Set to `0` to skip the demo data.                                     |
 | `HOST`                      | `127.0.0.1`                            | Listen address (read by Topcoat).                                     |
@@ -94,7 +99,7 @@ PostgreSQL; see "What is not covered" below.
 | `/companies`          | Searchable, paginated list with contact counts and open pipeline      |
 | `/companies/{id}`     | Details, contacts, deals, activity log                               |
 | `/contacts`           | Searchable, paginated list across name, email, and job title          |
-| `/contacts/{id}`      | Details, company, deals, activity log                                |
+| `/contacts/{id}`      | Details, company, deals, AI briefing, activity log                    |
 | `/deals`              | Paginated pipeline, filtered by title and stage                       |
 | `/deals/{id}`         | Details, quick stage change, activity log                            |
 | `/account`            | Your own password, two-factor settings, and live sessions             |
@@ -227,6 +232,14 @@ another site.
 
 **Response headers.** `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 and `Referrer-Policy: same-origin` are set on every authenticated response.
+
+**CSRF on every POST, including the ones with no fields.** The check lives in
+the form extractor, and the route macro only runs an extractor for a handler
+that declares a body parameter — so a `POST` route acting on its path alone (a
+delete, a sign-out) must declare one even though it has nothing to read. Missing
+that made every destructive route accept a token-less submission.
+`tests/post_routes_require_a_body.rs` enforces it for every `POST` route, so the
+next one cannot quietly omit it. See "A CSRF hole this feature found" below.
 
 **Tenant isolation.** Every read of tenant-owned data goes through
 `src/access.rs`; see "Workspaces" above. The filter is built in one place, and a
@@ -369,6 +382,30 @@ cargo run --features cli --bin crm-light-cli -- migration generate
 cargo run
 ```
 
+> **If a migration fails with `relation "users" already exists`**, the database
+> has tables but does not recognise the migration that would create them. That
+> happens when the migration files are regenerated from scratch: each carries a
+> random id, so a new `0000` is not seen as the one already applied, and it tries
+> to create everything again.
+>
+> For a development database the quickest fix is to start clean:
+>
+> ```bash
+> dropdb crm_light && createdb crm_light && cargo run
+> ```
+>
+> For a database with data you want to keep, tell it the new migration is
+> already applied, then let the following ones run:
+>
+> ```bash
+> psql -d crm_light -c "DELETE FROM __toasty_migrations;"
+> psql -d crm_light -c \
+>   "INSERT INTO __toasty_migrations (id, name, applied_at) \
+>    SELECT id, name, now() FROM (VALUES ($(grep -A1 '\[\[migrations\]\]' toasty/history.toml | grep '^id' | head -1 | cut -d' ' -f3))) AS t(id, name);"
+> ```
+>
+> Check the ids first with `grep -A2 migrations toasty/history.toml`.
+
 Migrations are compiled into the binary with `embed_migrations!`, and applied
 migrations are recorded in the database's `__toasty_migrations` table, so
 `apply` is idempotent — restarting never re-runs or re-creates anything. The
@@ -381,6 +418,65 @@ carries two kinds of index: the `(sort column, id)` order every list page walks,
 and tenant-first indexes for the `account_id` filter that leads almost every
 query. Without the second, the planner has to choose between the tenant index
 and the foreign-key index and filter afterwards.
+
+## AI briefings
+
+A contact page has a **Generate AI briefing** button. Pressing it asks a model
+for three bullet points — where the deal stands, what is uncertain, and the next
+step — and stores the result against that contact, along with the model name and
+the token counts it reported. The panel then shows when it was written and by
+whom, and the button becomes **Regenerate**.
+
+### It is off until you turn it on
+
+Without `CRM_AI_API_KEY` the panel says so and the route answers 404: an
+installation that has not opted in should not offer a button that cannot work.
+The key is the only switch, so enabling this is one deliberate act rather than a
+default somebody inherits.
+
+### What leaves the server
+
+This is the part worth being deliberate about. Pressing the button sends, for
+**that one contact**:
+
+- their name, job title, and the company they belong to;
+- their notes;
+- their deals, as stage and value;
+- up to 40 of their most recent activity entries, oldest first.
+
+Nothing about other contacts, companies, or workspaces is included. The set is
+assembled in one function — `ai::build_prompt` — rather than scraped together at
+the call site, so "what did we send?" has a single answer; and every briefing
+panel carries a line saying that this data goes to the configured provider.
+
+That is still customer data going to a third party, so there are two ways to
+live with it:
+
+- **Point `CRM_AI_BASE_URL` at a provider you have an agreement with**, or at a
+  local OpenAI-compatible server, and nothing leaves your network.
+- **Leave the key unset** and the feature is simply absent.
+
+### Why it is a button, and a POST that redirects
+
+Each briefing is one paid request, so it happens only when somebody asks. It is
+a `POST` and never a `GET`, because a `GET` would be spendable by a link
+prefetch, a crawler, or a refresh. The result is stored rather than regenerated
+on each page view, so a reload shows the briefing instead of buying another one.
+
+### What it does with a bad answer
+
+A briefing is a convenience, so it fails softly. A provider error, a timeout, or
+an unreadable reply produces a sentence on the contact page and stores nothing —
+never a 500 that loses the page the user was on. A model that ignores the JSON
+instruction and returns a plain bulleted list still renders, because the parser
+falls back to reading bullet-prefixed lines rather than erroring.
+
+### Choosing the model
+
+`CRM_AI_MODEL` defaults to `deepseek-chat`. There is no model called "flash" in
+DeepSeek's line-up — that naming is Google's — so this is the intended
+equivalent: the provider's fast, cheap general model. It is configuration
+precisely so you can change it without a rebuild.
 
 ## Deploying it
 
@@ -407,6 +503,27 @@ sudo ./deploy/configure.sh --domain crm.example.com && sudo systemctl restart cr
 
 Neither script needs to know your password: `configure.sh` reads the connection
 string out of the file `provision-db.sh` wrote, so it lives in one place.
+
+## A CSRF hole this feature found
+
+Worth recording, because it is the kind of bug that hides behind passing tests.
+
+Adding the briefing route meant writing a `POST` with no form fields, and it was
+natural to declare it `async fn generate_briefing(cx: &Cx)` — the contact comes
+from the path, so there is nothing to read. That compiles, works, and **accepts
+a token-less submission**: the CSRF check lives in the form extractor, and the
+route macro only runs an extractor for a handler that declares a body parameter.
+
+Auditing for the same mistake found nine routes in that shape — every delete,
+sign-out, and session revocation in the app. All of them acted on a token-less
+`POST`. `SameSite=Lax` was then the only obstacle, and the token the rest of the
+app relies on was never consulted.
+
+The fix is one parameter each, `body: CsrfForm<Empty>`, whose payload really is
+empty and whose purpose is the side effect.
+`tests/post_routes_require_a_body.rs` now fails if any `POST` route is declared
+without a body, and its ability to catch the regression was checked by putting
+the bug back.
 
 ## Notes and remaining limitations
 
@@ -441,7 +558,13 @@ The list of things a production CRM would still want:
   created a record, but an *edit* leaves no trace: changing a deal's value or a
   company's name is silent.
 - **No rate limiting beyond sign-in.** The failed-login throttle covers `/login`;
-  a signed-in account can POST as fast as it likes.
+  a signed-in account can POST as fast as it likes. That includes the AI button,
+  so a signed-in user can spend the operator's API credit as fast as they click.
+- **AI briefings have no per-workspace budget.** `CRM_AI_MAX_TOKENS` caps one
+  reply and the button is per-contact, but nothing caps how many briefings a
+  workspace can generate in a day.
+- **Briefings accumulate.** They are small, and the newest per contact is what
+  the page shows, but nothing prunes the older ones.
 - **Search is a `LIKE` scan.** No full-text search, no ranking, and no index
   beyond the single-column ones — a search still reads the matching rows.
 - **No tests that touch a database.** Every test is a unit test, so the SQL —

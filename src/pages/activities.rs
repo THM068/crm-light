@@ -103,7 +103,13 @@ async fn create(cx: &Cx, body: crate::csrf::CsrfForm<ActivityForm>) -> Result<Se
 }
 
 #[route(POST "/activities/{activity_id}/delete")]
-async fn destroy(cx: &Cx) -> Result<SeeOther> {
+async fn destroy(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     auth::require_user(cx)?;
     let mut db = db(cx);
     let tenant = Tenant::of(cx)?;
