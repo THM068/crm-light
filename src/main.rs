@@ -109,12 +109,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .app_context(db)
         .app_context(App {
             config: config.as_ref().clone(),
+            http: build_http_client(&config),
         })
         .app_context(config.time_zone.clone())
         .build();
 
     topcoat::start(router).await?;
     Ok(())
+}
+
+/// Build the process-wide HTTP client for AI provider calls.
+///
+/// The timeout is set here as well as on the request, so a call cannot hang the
+/// request that triggered it even if a later call site forgets to set one.
+fn build_http_client(config: &Config) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(config.ai.timeout)
+        // A briefing is one small request; a redirect to somewhere else is more
+        // likely to be a misconfigured base URL than something to follow.
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(concat!("crm-light/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("building the HTTP client")
 }
 
 /// Strip credentials out of a connection URL before printing it.

@@ -733,7 +733,13 @@ async fn reset_password(cx: &Cx, body: crate::csrf::CsrfForm<ResetPasswordForm>)
 }
 
 #[route(POST "/admin/users/{user_id}/sessions/revoke")]
-async fn revoke_sessions(cx: &Cx) -> Result<SeeOther> {
+async fn revoke_sessions(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = crate::db(cx);
     let tenant = Tenant::of(cx)?;
 
@@ -757,7 +763,13 @@ async fn revoke_sessions(cx: &Cx) -> Result<SeeOther> {
 }
 
 #[route(POST "/admin/users/{user_id}/delete")]
-async fn destroy(cx: &Cx) -> Result<SeeOther> {
+async fn destroy(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = crate::db(cx);
     let tenant = Tenant::of(cx)?;
 

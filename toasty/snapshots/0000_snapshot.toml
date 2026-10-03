@@ -208,7 +208,7 @@ columns = [{ column = { table = 1, index = 8 }, op = "Eq", scope = "Partition" }
 
 [[schema.tables]]
 id = 2
-name = "deals"
+name = "briefings"
 primary_key = { columns = [{ table = 2, index = 0 }], index = { table = 2, index = 0 } }
 
 [[schema.tables.columns]]
@@ -226,58 +226,44 @@ storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 2, index = 2 }
-name = "title"
-ty = "String"
-storage_ty = "Text"
-
-[[schema.tables.columns]]
-id = { table = 2, index = 3 }
-name = "value_cents"
+name = "contact_id"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
+id = { table = 2, index = 3 }
+name = "bullets"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
 id = { table = 2, index = 4 }
-name = "stage"
+name = "model"
 ty = "String"
 storage_ty = "Text"
 
 [[schema.tables.columns]]
 id = { table = 2, index = 5 }
-name = "company_id"
+name = "prompt_tokens"
 ty = "I64"
 storage_ty = { Integer = 8 }
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 2, index = 6 }
-name = "contact_id"
+name = "completion_tokens"
 ty = "I64"
 storage_ty = { Integer = 8 }
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 2, index = 7 }
-name = "expected_close"
-ty = "I64"
-storage_ty = { Integer = 8 }
-nullable = true
-
-[[schema.tables.columns]]
-id = { table = 2, index = 8 }
-name = "notes"
-ty = "String"
-storage_ty = "Text"
-nullable = true
-
-[[schema.tables.columns]]
-id = { table = 2, index = 9 }
 name = "created_at"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
-id = { table = 2, index = 10 }
+id = { table = 2, index = 8 }
 name = "created_by"
 ty = "I64"
 storage_ty = { Integer = 8 }
@@ -285,7 +271,7 @@ nullable = true
 
 [[schema.tables.indices]]
 id = { table = 2, index = 0 }
-name = "index_deals_by_id"
+name = "index_briefings_by_id"
 on = 2
 columns = [{ column = { table = 2, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -293,37 +279,25 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 2, index = 1 }
-name = "index_deals_by_account_id"
+name = "index_briefings_by_account_id"
 on = 2
 columns = [{ column = { table = 2, index = 1 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 2, index = 2 }
-name = "index_deals_by_stage"
+name = "index_briefings_by_contact_id"
 on = 2
-columns = [{ column = { table = 2, index = 4 }, op = "Eq", scope = "Partition" }]
+columns = [{ column = { table = 2, index = 2 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 2, index = 3 }
-name = "index_deals_by_company_id"
+name = "index_briefings_by_created_by"
 on = 2
-columns = [{ column = { table = 2, index = 5 }, op = "Eq", scope = "Partition" }]
-
-[[schema.tables.indices]]
-id = { table = 2, index = 4 }
-name = "index_deals_by_contact_id"
-on = 2
-columns = [{ column = { table = 2, index = 6 }, op = "Eq", scope = "Partition" }]
-
-[[schema.tables.indices]]
-id = { table = 2, index = 5 }
-name = "index_deals_by_created_by"
-on = 2
-columns = [{ column = { table = 2, index = 10 }, op = "Eq", scope = "Partition" }]
+columns = [{ column = { table = 2, index = 8 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables]]
 id = 3
-name = "contacts"
+name = "deals"
 primary_key = { columns = [{ table = 3, index = 0 }], index = { table = 3, index = 0 } }
 
 [[schema.tables.columns]]
@@ -341,40 +315,39 @@ storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 3, index = 2 }
-name = "first_name"
+name = "title"
 ty = "String"
 storage_ty = "Text"
 
 [[schema.tables.columns]]
 id = { table = 3, index = 3 }
-name = "last_name"
-ty = "String"
-storage_ty = "Text"
+name = "value_cents"
+ty = "I64"
+storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 3, index = 4 }
-name = "email"
+name = "stage"
 ty = "String"
 storage_ty = "Text"
-nullable = true
 
 [[schema.tables.columns]]
 id = { table = 3, index = 5 }
-name = "phone"
-ty = "String"
-storage_ty = "Text"
+name = "company_id"
+ty = "I64"
+storage_ty = { Integer = 8 }
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 3, index = 6 }
-name = "title"
-ty = "String"
-storage_ty = "Text"
+name = "contact_id"
+ty = "I64"
+storage_ty = { Integer = 8 }
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 3, index = 7 }
-name = "company_id"
+name = "expected_close"
 ty = "I64"
 storage_ty = { Integer = 8 }
 nullable = true
@@ -401,7 +374,7 @@ nullable = true
 
 [[schema.tables.indices]]
 id = { table = 3, index = 0 }
-name = "index_contacts_by_id"
+name = "index_deals_by_id"
 on = 3
 columns = [{ column = { table = 3, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -409,31 +382,37 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 3, index = 1 }
-name = "index_contacts_by_account_id"
+name = "index_deals_by_account_id"
 on = 3
 columns = [{ column = { table = 3, index = 1 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 3, index = 2 }
-name = "index_contacts_by_email"
+name = "index_deals_by_stage"
 on = 3
 columns = [{ column = { table = 3, index = 4 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 3, index = 3 }
-name = "index_contacts_by_company_id"
+name = "index_deals_by_company_id"
 on = 3
-columns = [{ column = { table = 3, index = 7 }, op = "Eq", scope = "Partition" }]
+columns = [{ column = { table = 3, index = 5 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 3, index = 4 }
-name = "index_contacts_by_created_by"
+name = "index_deals_by_contact_id"
+on = 3
+columns = [{ column = { table = 3, index = 6 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables.indices]]
+id = { table = 3, index = 5 }
+name = "index_deals_by_created_by"
 on = 3
 columns = [{ column = { table = 3, index = 10 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables]]
 id = 4
-name = "companies"
+name = "contacts"
 primary_key = { columns = [{ table = 4, index = 0 }], index = { table = 4, index = 0 } }
 
 [[schema.tables.columns]]
@@ -451,20 +430,19 @@ storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 4, index = 2 }
-name = "name"
+name = "first_name"
 ty = "String"
 storage_ty = "Text"
 
 [[schema.tables.columns]]
 id = { table = 4, index = 3 }
-name = "industry"
+name = "last_name"
 ty = "String"
 storage_ty = "Text"
-nullable = true
 
 [[schema.tables.columns]]
 id = { table = 4, index = 4 }
-name = "website"
+name = "email"
 ty = "String"
 storage_ty = "Text"
 nullable = true
@@ -478,19 +456,33 @@ nullable = true
 
 [[schema.tables.columns]]
 id = { table = 4, index = 6 }
-name = "notes"
+name = "title"
 ty = "String"
 storage_ty = "Text"
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 4, index = 7 }
+name = "company_id"
+ty = "I64"
+storage_ty = { Integer = 8 }
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 4, index = 8 }
+name = "notes"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 4, index = 9 }
 name = "created_at"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
-id = { table = 4, index = 8 }
+id = { table = 4, index = 10 }
 name = "created_by"
 ty = "I64"
 storage_ty = { Integer = 8 }
@@ -498,7 +490,7 @@ nullable = true
 
 [[schema.tables.indices]]
 id = { table = 4, index = 0 }
-name = "index_companies_by_id"
+name = "index_contacts_by_id"
 on = 4
 columns = [{ column = { table = 4, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -506,25 +498,31 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 4, index = 1 }
-name = "index_companies_by_account_id"
+name = "index_contacts_by_account_id"
 on = 4
 columns = [{ column = { table = 4, index = 1 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 4, index = 2 }
-name = "index_companies_by_name"
+name = "index_contacts_by_email"
 on = 4
-columns = [{ column = { table = 4, index = 2 }, op = "Eq", scope = "Partition" }]
+columns = [{ column = { table = 4, index = 4 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 4, index = 3 }
-name = "index_companies_by_created_by"
+name = "index_contacts_by_company_id"
 on = 4
-columns = [{ column = { table = 4, index = 8 }, op = "Eq", scope = "Partition" }]
+columns = [{ column = { table = 4, index = 7 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables.indices]]
+id = { table = 4, index = 4 }
+name = "index_contacts_by_created_by"
+on = 4
+columns = [{ column = { table = 4, index = 10 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables]]
 id = 5
-name = "login_attempts"
+name = "companies"
 primary_key = { columns = [{ table = 5, index = 0 }], index = { table = 5, index = 0 } }
 
 [[schema.tables.columns]]
@@ -542,32 +540,54 @@ storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 5, index = 2 }
-name = "username_lower"
+name = "name"
 ty = "String"
 storage_ty = "Text"
 
 [[schema.tables.columns]]
 id = { table = 5, index = 3 }
-name = "failures"
-ty = "I64"
-storage_ty = { Integer = 8 }
+name = "industry"
+ty = "String"
+storage_ty = "Text"
+nullable = true
 
 [[schema.tables.columns]]
 id = { table = 5, index = 4 }
-name = "locked_until"
-ty = "I64"
-storage_ty = { Integer = 8 }
+name = "website"
+ty = "String"
+storage_ty = "Text"
 nullable = true
 
 [[schema.tables.columns]]
 id = { table = 5, index = 5 }
-name = "last_failure_at"
+name = "phone"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 5, index = 6 }
+name = "notes"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 5, index = 7 }
+name = "created_at"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
+[[schema.tables.columns]]
+id = { table = 5, index = 8 }
+name = "created_by"
+ty = "I64"
+storage_ty = { Integer = 8 }
+nullable = true
+
 [[schema.tables.indices]]
 id = { table = 5, index = 0 }
-name = "index_login_attempts_by_id"
+name = "index_companies_by_id"
 on = 5
 columns = [{ column = { table = 5, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -575,19 +595,25 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 5, index = 1 }
-name = "index_login_attempts_by_account_id"
+name = "index_companies_by_account_id"
 on = 5
 columns = [{ column = { table = 5, index = 1 }, op = "Eq", scope = "Partition" }]
 
 [[schema.tables.indices]]
 id = { table = 5, index = 2 }
-name = "index_login_attempts_by_username_lower"
+name = "index_companies_by_name"
 on = 5
 columns = [{ column = { table = 5, index = 2 }, op = "Eq", scope = "Partition" }]
 
+[[schema.tables.indices]]
+id = { table = 5, index = 3 }
+name = "index_companies_by_created_by"
+on = 5
+columns = [{ column = { table = 5, index = 8 }, op = "Eq", scope = "Partition" }]
+
 [[schema.tables]]
 id = 6
-name = "sessions"
+name = "login_attempts"
 primary_key = { columns = [{ table = 6, index = 0 }], index = { table = 6, index = 0 } }
 
 [[schema.tables.columns]]
@@ -599,58 +625,38 @@ auto_increment = true
 
 [[schema.tables.columns]]
 id = { table = 6, index = 1 }
-name = "token_hash"
-ty = "String"
-storage_ty = "Text"
-
-[[schema.tables.columns]]
-id = { table = 6, index = 2 }
 name = "account_id"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
+id = { table = 6, index = 2 }
+name = "username_lower"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
 id = { table = 6, index = 3 }
-name = "user_id"
+name = "failures"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 6, index = 4 }
-name = "created_at"
+name = "locked_until"
 ty = "I64"
 storage_ty = { Integer = 8 }
+nullable = true
 
 [[schema.tables.columns]]
 id = { table = 6, index = 5 }
-name = "expires_at"
+name = "last_failure_at"
 ty = "I64"
 storage_ty = { Integer = 8 }
-
-[[schema.tables.columns]]
-id = { table = 6, index = 6 }
-name = "revoked_at"
-ty = "I64"
-storage_ty = { Integer = 8 }
-nullable = true
-
-[[schema.tables.columns]]
-id = { table = 6, index = 7 }
-name = "user_agent"
-ty = "String"
-storage_ty = "Text"
-nullable = true
-
-[[schema.tables.columns]]
-id = { table = 6, index = 8 }
-name = "ip"
-ty = "String"
-storage_ty = "Text"
-nullable = true
 
 [[schema.tables.indices]]
 id = { table = 6, index = 0 }
-name = "index_sessions_by_id"
+name = "index_login_attempts_by_id"
 on = 6
 columns = [{ column = { table = 6, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -658,26 +664,19 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 6, index = 1 }
-name = "index_sessions_by_token_hash"
+name = "index_login_attempts_by_account_id"
 on = 6
 columns = [{ column = { table = 6, index = 1 }, op = "Eq", scope = "Partition" }]
-unique = true
 
 [[schema.tables.indices]]
 id = { table = 6, index = 2 }
-name = "index_sessions_by_account_id"
+name = "index_login_attempts_by_username_lower"
 on = 6
 columns = [{ column = { table = 6, index = 2 }, op = "Eq", scope = "Partition" }]
 
-[[schema.tables.indices]]
-id = { table = 6, index = 3 }
-name = "index_sessions_by_user_id"
-on = 6
-columns = [{ column = { table = 6, index = 3 }, op = "Eq", scope = "Partition" }]
-
 [[schema.tables]]
 id = 7
-name = "accounts"
+name = "sessions"
 primary_key = { columns = [{ table = 7, index = 0 }], index = { table = 7, index = 0 } }
 
 [[schema.tables.columns]]
@@ -689,32 +688,58 @@ auto_increment = true
 
 [[schema.tables.columns]]
 id = { table = 7, index = 1 }
-name = "name"
+name = "token_hash"
 ty = "String"
 storage_ty = "Text"
 
 [[schema.tables.columns]]
 id = { table = 7, index = 2 }
-name = "slug"
-ty = "String"
-storage_ty = "Text"
+name = "account_id"
+ty = "I64"
+storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 7, index = 3 }
-name = "created_at"
+name = "user_id"
 ty = "I64"
 storage_ty = { Integer = 8 }
 
 [[schema.tables.columns]]
 id = { table = 7, index = 4 }
-name = "created_by"
+name = "created_at"
+ty = "I64"
+storage_ty = { Integer = 8 }
+
+[[schema.tables.columns]]
+id = { table = 7, index = 5 }
+name = "expires_at"
+ty = "I64"
+storage_ty = { Integer = 8 }
+
+[[schema.tables.columns]]
+id = { table = 7, index = 6 }
+name = "revoked_at"
 ty = "I64"
 storage_ty = { Integer = 8 }
 nullable = true
 
+[[schema.tables.columns]]
+id = { table = 7, index = 7 }
+name = "user_agent"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 7, index = 8 }
+name = "ip"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
 [[schema.tables.indices]]
 id = { table = 7, index = 0 }
-name = "index_accounts_by_id"
+name = "index_sessions_by_id"
 on = 7
 columns = [{ column = { table = 7, index = 0 }, op = "Eq", scope = "Partition" }]
 unique = true
@@ -722,7 +747,71 @@ primary_key = true
 
 [[schema.tables.indices]]
 id = { table = 7, index = 1 }
-name = "index_accounts_by_slug"
+name = "index_sessions_by_token_hash"
+on = 7
+columns = [{ column = { table = 7, index = 1 }, op = "Eq", scope = "Partition" }]
+unique = true
+
+[[schema.tables.indices]]
+id = { table = 7, index = 2 }
+name = "index_sessions_by_account_id"
 on = 7
 columns = [{ column = { table = 7, index = 2 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables.indices]]
+id = { table = 7, index = 3 }
+name = "index_sessions_by_user_id"
+on = 7
+columns = [{ column = { table = 7, index = 3 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables]]
+id = 8
+name = "accounts"
+primary_key = { columns = [{ table = 8, index = 0 }], index = { table = 8, index = 0 } }
+
+[[schema.tables.columns]]
+id = { table = 8, index = 0 }
+name = "id"
+ty = "I64"
+storage_ty = { Integer = 8 }
+auto_increment = true
+
+[[schema.tables.columns]]
+id = { table = 8, index = 1 }
+name = "name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 8, index = 2 }
+name = "slug"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 8, index = 3 }
+name = "created_at"
+ty = "I64"
+storage_ty = { Integer = 8 }
+
+[[schema.tables.columns]]
+id = { table = 8, index = 4 }
+name = "created_by"
+ty = "I64"
+storage_ty = { Integer = 8 }
+nullable = true
+
+[[schema.tables.indices]]
+id = { table = 8, index = 0 }
+name = "index_accounts_by_id"
+on = 8
+columns = [{ column = { table = 8, index = 0 }, op = "Eq", scope = "Partition" }]
+unique = true
+primary_key = true
+
+[[schema.tables.indices]]
+id = { table = 8, index = 1 }
+name = "index_accounts_by_slug"
+on = 8
+columns = [{ column = { table = 8, index = 2 }, op = "Eq", scope = "Partition" }]
 unique = true

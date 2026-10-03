@@ -26,7 +26,7 @@
 use toasty::Db;
 use topcoat::router::error::{BadRequestError, ForbiddenError, NotFoundError, bad_request, forbidden, not_found};
 
-use crate::models::{Activity, Company, Contact, Deal, User};
+use crate::models::{Account, Activity, Briefing, Company, Contact, Deal, User};
 
 /// A tenant-owned model, loadable under the rules above.
 ///
@@ -328,6 +328,24 @@ impl_loadable!(Activity, "activity");
 // A user is tenant-owned too, which is what stops one workspace's
 // administrator from managing another's people.
 impl_loadable!(User, "account");
+impl_loadable!(Briefing, "briefing");
+
+// A workspace is not scoped to a workspace — it *is* one — so it does not fit
+// the `Loadable` shape above. It is reached by the session's own `account_id`,
+// which `require_account` is the only way to do.
+
+/// The signed-in workspace, by id.
+///
+/// # Errors
+///
+/// 404 when the row is gone, which means a session outlived its workspace.
+pub async fn require_account(db: &mut Db, account_id: i64) -> topcoat::Result<Account> {
+    Account::filter(Account::fields().id().eq(account_id))
+        .first()
+        .exec(db)
+        .await?
+        .ok_or_else(|| not_found().into())
+}
 
 /// The error types the layout's error boundary renders.
 ///
@@ -418,6 +436,7 @@ mod tests {
         assert_loadable::<Deal>();
         assert_loadable::<Activity>();
         assert_loadable::<User>();
+        assert_loadable::<Briefing>();
 
         // The kinds are what the 403 message names, so they have to read like
         // nouns a person would recognise.

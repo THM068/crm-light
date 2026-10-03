@@ -311,7 +311,13 @@ async fn login(cx: &Cx, body: crate::csrf::CsrfForm<LoginForm>) -> Result<SeeOth
 }
 
 #[route(POST "/logout")]
-async fn logout(cx: &Cx) -> Result<SeeOther> {
+async fn logout(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = crate::db(cx);
     if let Some(token) = auth::session_token(cx) {
         // Revoked server-side, not merely forgotten by the browser.
@@ -623,7 +629,13 @@ async fn disable_totp(cx: &Cx, body: crate::csrf::CsrfForm<PasswordForm>) -> Res
 }
 
 #[route(POST "/account/sessions/revoke")]
-async fn revoke_other_sessions(cx: &Cx) -> Result<SeeOther> {
+async fn revoke_other_sessions(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = crate::db(cx);
     let current = auth::require_user(cx)?;
     let config = crate::config_of(cx);

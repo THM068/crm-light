@@ -676,7 +676,13 @@ async fn update(cx: &Cx, body: crate::csrf::CsrfForm<DealForm>) -> Result<SeeOth
 // --- Delete ----------------------------------------------------------------
 
 #[route(POST "/deals/{deal_id}/delete")]
-async fn destroy(cx: &Cx) -> Result<SeeOther> {
+async fn destroy(
+    cx: &Cx,
+    body: crate::csrf::CsrfForm<crate::csrf::Checked>,
+) -> Result<SeeOther> {
+    // The token has been validated by the extractor by the time this runs; a
+    // route that acts on its path alone still declares a body so that it is.
+    let crate::csrf::CsrfForm(crate::csrf::Checked {}) = body;
     let mut db = db(cx);
     let tenant = Tenant::of(cx)?;
 

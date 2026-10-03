@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use topcoat::{
     Result,
@@ -233,6 +234,35 @@ where
         Ok(Self(payload))
     }
 }
+
+/// A form body with no fields of its own, whose token has been checked.
+///
+/// # Why a route with no fields still needs a body parameter
+///
+/// The CSRF check lives in the extractor, and the route macro only runs an
+/// extractor for a handler that declares a **body parameter**. A `POST` route
+/// that acts on its path alone — a delete, a sign-out, revoking a session — has
+/// nothing to read, so it is natural to write `async fn destroy(cx: &Cx)` and
+/// reach for the path parameter inside. That compiles, works, and accepts a
+/// token-less submission: `SameSite=Lax` is then the only thing standing
+/// between a cross-site page and the deletion, and the token the rest of the
+/// app relies on is never consulted.
+///
+/// Declaring `body: CsrfForm<Checked>` is what makes the token required, and
+/// destructuring it is what says so at the top of the handler:
+///
+/// ```ignore
+/// async fn destroy(cx: &Cx, body: CsrfForm<Checked>) -> Result<SeeOther> {
+///     let CsrfForm(Checked) = body;
+///     // …
+/// }
+/// ```
+///
+/// The destructuring is not ceremony to delete: removing the parameter removes
+/// the check, which is why `tests/post_routes_require_a_body.rs` fails if any
+/// `POST` route is declared without one.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Checked {}
 
 /// A `400` for a form body that could not be read at all.
 #[must_use]
